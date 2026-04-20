@@ -1,0 +1,63 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environments
+.env
+.env.*
+.venv/
+venv/
+env/
+.python-version
+.conda/
+.conda-envs/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Logs
+*.log
+EXPERIMENT_LOG_hpc.md
+
+# Generated experiment artifacts
+outputs/
+wandb/
+mlruns/
+runs/
+
+# Local datasets / caches if created inside the repo later
+data/
+datasets/
+image-eeg-data/
+cache/
+
+# Large model weights and checkpoints
+models/checkpoints/
+models/ensemble_lora/
+models/*.pt
+models/*.pth
+models/*.pth.tar
+models/*.bin
+models/*.ckpt
+models/*.safetensors
+models/*.zip
+models/trusted_list
+
+# Keep vendored code, but ignore generated cache under it
+models/facebookresearch_dino_main/__pycache__/

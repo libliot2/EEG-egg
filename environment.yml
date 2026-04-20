@@ -1,0 +1,6 @@
+name: project1-eeg
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
