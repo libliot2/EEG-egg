@@ -72,6 +72,7 @@ Useful scripts:
 - `scripts/predict_retrieval.py`
 - `scripts/train_reconstruction_embed.py`
 - `scripts/predict_reconstruction_embed.py`
+- `scripts/predict_reconstruction_sdxl_img2img.py`
 - `scripts/train_eeg_pretrain.py`
 - `scripts/log_experiment.py`
 

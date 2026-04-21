@@ -41,7 +41,7 @@ from project1_eeg.utils import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train EEG-to-Kandinsky-embedding reconstruction model.")
+    parser = argparse.ArgumentParser(description="Train EEG-to-image-embedding reconstruction model.")
     parser.add_argument("--retrieval-checkpoint", type=Path, required=True)
     parser.add_argument(
         "--model-type",
@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=default_bank_path(DEFAULT_OUTPUT_DIR, "kandinsky", "train"),
     )
+    parser.add_argument("--target-space", choices=["auto", "kandinsky", "clip"], default="auto")
     parser.add_argument("--retrieval-bank", type=Path, default=None)
     parser.add_argument("--text-bank", type=Path, default=None)
     parser.add_argument("--use-text-aux", action="store_true")
@@ -122,6 +123,17 @@ def average_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
         return {}
     keys = metrics[0].keys()
     return {key: float(sum(item[key] for item in metrics) / len(metrics)) for key in keys}
+
+
+def resolve_target_space(args: argparse.Namespace, embedding_bank: TensorBank) -> str:
+    if args.target_space != "auto":
+        return args.target_space
+    if embedding_bank.bank_type in {"kandinsky", "clip"}:
+        return str(embedding_bank.bank_type)
+    raise ValueError(
+        "Unable to infer target space from the embedding bank. "
+        "Pass --target-space explicitly."
+    )
 
 
 def resolve_artifact_path(path: str | Path | None, *, base_paths: Iterable[Path] = ()) -> Path | None:
@@ -758,10 +770,11 @@ def main() -> None:
     if not args.embedding_bank.exists():
         raise FileNotFoundError(
             f"Embedding bank not found: {args.embedding_bank}. "
-            "Run scripts/cache_image_bank.py --bank-type kandinsky --split train first."
+            "Run scripts/cache_image_bank.py for the desired target bank first."
         )
 
     embedding_bank = TensorBank.load(args.embedding_bank)
+    target_space = resolve_target_space(args, embedding_bank)
     retrieval_assets = load_retrieval_assets(
         args.retrieval_checkpoint,
         device=device,
@@ -845,7 +858,9 @@ def main() -> None:
 
     config = {
         "task": "reconstruction_embed",
-        "mode": "kandinsky_image_embedding",
+        "mode": f"{target_space}_image_embedding",
+        "target_space": target_space,
+        "embedding_bank_type": embedding_bank.bank_type,
         "model_type": args.model_type,
         "seed": args.seed,
         "val_ratio": args.val_ratio,
@@ -875,8 +890,8 @@ def main() -> None:
         "teacher_head": retrieval_assets["teacher_head"],
         "train_avg_trials": True,
         "val_avg_trials": True,
-        "image_eval_every": args.image_eval_every,
-        "image_eval_limit": args.image_eval_limit,
+        "image_eval_every": args.image_eval_every if target_space == "kandinsky" else 0,
+        "image_eval_limit": args.image_eval_limit if target_space == "kandinsky" else 0,
         "decode_batch_size": args.decode_batch_size,
         "num_candidates": args.num_candidates,
         "decoder_steps": args.decoder_steps,
@@ -980,7 +995,8 @@ def main() -> None:
 
         image_metrics: dict[str, float] = {}
         should_eval_images = (
-            args.image_eval_limit > 0
+            target_space == "kandinsky"
+            and args.image_eval_limit > 0
             and (epoch % args.image_eval_every == 0 or epoch == args.epochs)
             and probe_ids
         )

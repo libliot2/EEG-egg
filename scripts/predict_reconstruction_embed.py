@@ -19,6 +19,7 @@ from project1_eeg.kandinsky import (
     DEFAULT_KANDINSKY_PRIOR_MODEL,
     generate_best_images,
     load_kandinsky_decoder_pipeline,
+    load_kandinsky_img2img_decoder_pipeline,
     load_kandinsky_prior_pipeline,
     negative_image_embed_from_bank,
 )
@@ -76,6 +77,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-guidance-scale", type=float, default=None)
     parser.add_argument("--decoder-height", type=int, default=None)
     parser.add_argument("--decoder-width", type=int, default=None)
+    parser.add_argument("--init-image-dir", type=Path, default=None)
+    parser.add_argument("--img2img-strength", type=float, default=0.5)
+    parser.add_argument("--candidate-seed-offset", type=int, default=0)
     parser.add_argument("--retrieval-topk", type=int, default=None)
     parser.add_argument("--use-text-context", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
@@ -167,6 +171,16 @@ def resolve_generation_config(
         "decoder_height": int(coalesce(args.decoder_height, config.get("decoder_height") if config else None, 512)),
         "decoder_width": int(coalesce(args.decoder_width, config.get("decoder_width") if config else None, 512)),
     }
+
+
+def resolve_init_image_paths(query_ids: list[str], init_image_dir: Path) -> list[Path]:
+    init_paths: list[Path] = []
+    for image_id in query_ids:
+        path = init_image_dir / f"{image_id}.png"
+        if not path.exists():
+            raise FileNotFoundError(f"Init image not found for '{image_id}': {path}")
+        init_paths.append(path)
+    return init_paths
 
 
 def load_embedding_model(checkpoint_path: Path, device: torch.device):
@@ -366,6 +380,10 @@ def resolve_conditioning_embeddings(
 def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
+    if args.init_image_dir is not None and not args.init_image_dir.exists():
+        raise FileNotFoundError(f"Init image directory not found: {args.init_image_dir}")
+    if not (0.0 < args.img2img_strength <= 1.0):
+        raise ValueError("--img2img-strength must be in (0, 1].")
 
     embedding_model = None
     embedding_config = None
@@ -443,11 +461,18 @@ def main() -> None:
         device=device,
         local_files_only=args.local_files_only,
     )
-    decoder_pipe = load_kandinsky_decoder_pipeline(
-        model_name=str(generation_config["decoder_model"]),
-        device=device,
-        local_files_only=args.local_files_only,
-    )
+    if args.init_image_dir is None:
+        decoder_pipe = load_kandinsky_decoder_pipeline(
+            model_name=str(generation_config["decoder_model"]),
+            device=device,
+            local_files_only=args.local_files_only,
+        )
+    else:
+        decoder_pipe = load_kandinsky_img2img_decoder_pipeline(
+            model_name=str(generation_config["decoder_model"]),
+            device=device,
+            local_files_only=args.local_files_only,
+        )
 
     negative_image_embed = negative_image_embed_from_bank(
         embedding_bank,
@@ -478,6 +503,11 @@ def main() -> None:
     all_real_images: list[torch.Tensor] = []
 
     for batch in loader:
+        init_paths = None
+        init_images = None
+        if args.init_image_dir is not None:
+            init_paths = resolve_init_image_paths(list(batch["image_id"]), args.init_image_dir)
+            init_images = load_image_batch(init_paths, image_size=int(generation_config["decoder_height"]))
         conditioning_embeddings, conditioning_context = resolve_conditioning_embeddings(
             args=args,
             batch=batch,
@@ -503,6 +533,9 @@ def main() -> None:
             guidance_scale=float(generation_config["decoder_guidance_scale"]),
             height=int(generation_config["decoder_height"]),
             width=int(generation_config["decoder_width"]),
+            init_images=init_images,
+            img2img_strength=args.img2img_strength,
+            candidate_seed_offset=args.candidate_seed_offset,
         )
         selected_images = generation["selected_images"]
         saved_paths = save_image_batch(selected_images, list(batch["image_id"]), output_images_dir)
@@ -528,12 +561,20 @@ def main() -> None:
             conditioning_context,
             strict=True,
         ):
+            init_image_path = None
+            if init_paths is not None:
+                init_image_path = str((args.init_image_dir / f"{query_id}.png").resolve())
             item = {
                 "query_image_id": query_id,
                 "output_path": output_path,
                 "mode": "embedding_decoder",
                 "model_type": effective_model_type,
                 "embedding_source": args.embedding_source,
+                "init_image_mode": "external_dir" if args.init_image_dir is not None else "none",
+                "init_image_path": init_image_path,
+                "img2img_strength": float(args.img2img_strength) if args.init_image_dir is not None else None,
+                "candidate_seed_offset": int(args.candidate_seed_offset),
+                "generation_mode": generation["generation_mode"],
                 "selection_mode": "max_cosine_to_conditioning_embedding",
                 "candidate_seeds": candidate_seeds,
                 "selected_candidate_index": int(selected_index),
@@ -562,6 +603,10 @@ def main() -> None:
             "decoder_guidance_scale": float(generation_config["decoder_guidance_scale"]),
             "decoder_height": float(generation_config["decoder_height"]),
             "decoder_width": float(generation_config["decoder_width"]),
+            "init_image_mode": "external_dir" if args.init_image_dir is not None else "none",
+            "init_image_dir": None if args.init_image_dir is None else str(args.init_image_dir.resolve()),
+            "img2img_strength": float(args.img2img_strength) if args.init_image_dir is not None else None,
+            "candidate_seed_offset": int(args.candidate_seed_offset),
             "reconstruction_checkpoint": None
             if args.reconstruction_checkpoint is None
             else str(args.reconstruction_checkpoint.resolve()),

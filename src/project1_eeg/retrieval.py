@@ -79,10 +79,11 @@ class EEGEncoder(nn.Module):
         return F.normalize(embedding, dim=-1)
 
 
-class ATMSmallEncoder(nn.Module):
+class ATMEncoder(nn.Module):
     def __init__(
         self,
         *,
+        variant: str = "small",
         in_channels: int = 63,
         hidden_dim: int = 256,
         embedding_dim: int = 768,
@@ -93,9 +94,24 @@ class ATMSmallEncoder(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        if variant not in {"small", "base", "large"}:
+            raise ValueError(f"Unknown ATM encoder variant: {variant}")
         self.channel_dropout = channel_dropout
         self.time_mask_ratio = time_mask_ratio
         self.output_dim = embedding_dim
+        self.variant = variant
+
+        temporal_dilations = {
+            "small": (1, 2, 4),
+            "base": (1, 2, 4, 8),
+            "large": (1, 2, 4, 8, 16),
+        }[variant]
+        frequency_dilations = {
+            "small": (1, 2),
+            "base": (1, 2, 4),
+            "large": (1, 2, 4, 8),
+        }[variant]
+        frequency_hidden_dim = max(hidden_dim // 2, 64)
 
         self.temporal_stem = nn.Sequential(
             nn.Conv1d(in_channels, hidden_dim, kernel_size=7, padding=3, bias=False),
@@ -103,9 +119,7 @@ class ATMSmallEncoder(nn.Module):
             nn.GELU(),
         )
         self.temporal_blocks = nn.Sequential(
-            ResidualTemporalBlock(hidden_dim, dilation=1),
-            ResidualTemporalBlock(hidden_dim, dilation=2),
-            ResidualTemporalBlock(hidden_dim, dilation=4),
+            *(ResidualTemporalBlock(hidden_dim, dilation=dilation) for dilation in temporal_dilations)
         )
         self.temporal_attention = nn.Conv1d(hidden_dim, 1, kernel_size=1)
 
@@ -122,14 +136,13 @@ class ATMSmallEncoder(nn.Module):
         self.transformer_norm = nn.LayerNorm(hidden_dim)
 
         self.frequency_branch = nn.Sequential(
-            nn.Conv1d(in_channels, hidden_dim // 2, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm1d(hidden_dim // 2),
+            nn.Conv1d(in_channels, frequency_hidden_dim, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(frequency_hidden_dim),
             nn.GELU(),
-            ResidualTemporalBlock(hidden_dim // 2, dilation=1),
-            ResidualTemporalBlock(hidden_dim // 2, dilation=2),
+            *(ResidualTemporalBlock(frequency_hidden_dim, dilation=dilation) for dilation in frequency_dilations),
         )
 
-        fusion_dim = hidden_dim * 2 + hidden_dim // 2
+        fusion_dim = hidden_dim * 2 + frequency_hidden_dim
         self.projection = nn.Sequential(
             nn.Linear(fusion_dim, hidden_dim * 2),
             nn.GELU(),
@@ -165,6 +178,21 @@ class ATMSmallEncoder(nn.Module):
 
         fused = torch.cat([temporal_pooled, transformed, frequency], dim=-1)
         return self.projection(fused)
+
+
+class ATMSmallEncoder(ATMEncoder):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(variant="small", **kwargs)
+
+
+class ATMBaseEncoder(ATMEncoder):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(variant="base", **kwargs)
+
+
+class ATMLargeEncoder(ATMEncoder):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(variant="large", **kwargs)
 
 
 class ProjectionHead(nn.Module):
@@ -247,11 +275,19 @@ class RetrievalModel(nn.Module):
             return
 
         if encoder_type == "legacy_cnn":
-            raise ValueError("Dual-head training requires encoder_type='atm_small'.")
+            raise ValueError("Dual-head training requires an ATM encoder variant, not encoder_type='legacy_cnn'.")
         if semantic_dim is None and perceptual_dim is None:
             raise ValueError("At least one retrieval head must be enabled.")
 
-        self.encoder = ATMSmallEncoder(
+        encoder_cls = {
+            "atm_small": ATMSmallEncoder,
+            "atm_base": ATMBaseEncoder,
+            "atm_large": ATMLargeEncoder,
+        }.get(encoder_type)
+        if encoder_cls is None:
+            raise ValueError(f"Unknown encoder_type: {encoder_type}")
+
+        self.encoder = encoder_cls(
             in_channels=in_channels,
             hidden_dim=hidden_dim,
             embedding_dim=embedding_dim,

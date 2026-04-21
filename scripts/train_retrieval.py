@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-dim", type=int, default=768)
     parser.add_argument("--channel-dropout", type=float, default=0.1)
     parser.add_argument("--time-mask-ratio", type=float, default=0.1)
-    parser.add_argument("--encoder-type", choices=["legacy_cnn", "atm_small"], default="atm_small")
+    parser.add_argument("--encoder-type", choices=["legacy_cnn", "atm_small", "atm_base", "atm_large"], default="atm_small")
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--perceptual-loss-weight", type=float, default=0.7)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--train-no-avg-trials", action="store_true")
+    parser.add_argument("--train-trial-sampling", action="store_true")
+    parser.add_argument("--train-trial-k-min", type=int, default=1)
+    parser.add_argument("--train-trial-k-max", type=int, default=4)
+    parser.add_argument("--selection-metric", choices=["top1", "top5", "blend_top1_top5"], default="blend_top1_top5")
+    parser.add_argument("--save-every-epoch", action="store_true")
+    parser.add_argument("--keep-last-k", type=int, default=5)
     return parser.parse_args()
 
 
@@ -71,6 +77,18 @@ def average_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
         return {}
     keys = metrics[0].keys()
     return {key: float(sum(item[key] for item in metrics) / len(metrics)) for key in keys}
+
+
+def selection_score(metrics: dict[str, float], *, selection_metric: str) -> tuple[float, ...]:
+    top1 = float(metrics["top1_acc"])
+    top5 = float(metrics["top5_acc"])
+    if selection_metric == "top1":
+        return (top1, top5)
+    if selection_metric == "top5":
+        return (top5, top1)
+    if selection_metric == "blend_top1_top5":
+        return (0.5 * top1 + 0.5 * top5, top1, top5)
+    raise ValueError(f"Unknown selection_metric: {selection_metric}")
 
 
 def train_one_epoch(
@@ -151,6 +169,9 @@ def main() -> None:
     set_seed(args.seed)
     device = resolve_device(args.device)
 
+    if args.train_no_avg_trials and args.train_trial_sampling:
+        raise ValueError("--train-no-avg-trials and --train-trial-sampling cannot both be enabled.")
+
     semantic_bank = load_bank(args.semantic_bank, name="Semantic") if args.semantic_bank is not None else None
     perceptual_bank = load_bank(args.perceptual_bank, name="Perceptual") if args.perceptual_bank is not None else None
     if semantic_bank is None and perceptual_bank is None:
@@ -171,7 +192,8 @@ def main() -> None:
     train_records = load_eeg_records(
         data_dir=args.data_dir,
         split="train",
-        avg_trials=not args.train_no_avg_trials,
+        avg_trials=not args.train_no_avg_trials and not args.train_trial_sampling,
+        preserve_trials=args.train_trial_sampling,
         image_ids=train_ids,
     )
     val_records = load_eeg_records(
@@ -182,7 +204,12 @@ def main() -> None:
     )
 
     train_loader = make_dataloader(
-        EEGImageDataset(train_records),
+        EEGImageDataset(
+            train_records,
+            trial_sampling="random_avg" if args.train_trial_sampling else "none",
+            trial_k_min=args.train_trial_k_min,
+            trial_k_max=args.train_trial_k_max,
+        ),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -234,7 +261,10 @@ def main() -> None:
         "perceptual_dim": perceptual_dim,
         "semantic_loss_weight": args.semantic_loss_weight,
         "perceptual_loss_weight": args.perceptual_loss_weight,
-        "train_avg_trials": not args.train_no_avg_trials,
+        "train_avg_trials": not args.train_no_avg_trials and not args.train_trial_sampling,
+        "train_trial_sampling": bool(args.train_trial_sampling),
+        "train_trial_k_min": int(args.train_trial_k_min),
+        "train_trial_k_max": int(args.train_trial_k_max),
         "val_avg_trials": True,
         "in_channels": int(train_records[0].eeg.shape[0]),
         "semantic_bank": None if args.semantic_bank is None else str(args.semantic_bank),
@@ -242,13 +272,19 @@ def main() -> None:
         "ordered_val_image_ids": ordered_image_ids(val_records),
         "alpha_grid": [step / 10.0 for step in range(11)],
         "alpha_selection_rule": "maximize_val_top1_then_val_top5_then_closest_to_0.5",
+        "selection_metric": args.selection_metric,
+        "save_every_epoch": bool(args.save_every_epoch),
+        "keep_last_k": int(args.keep_last_k),
     }
     save_json(config, run_dir / "config.json")
     save_json({"train_ids": train_ids, "val_ids": val_ids}, run_dir / "split.json")
 
-    best_score = (float("-inf"), float("-inf"))
+    best_selection = (float("-inf"), float("-inf"), float("-inf"))
+    best_top1 = (float("-inf"), float("-inf"))
+    best_top5 = (float("-inf"), float("-inf"))
     history: list[dict[str, float]] = []
     alpha_search_history: list[dict[str, object]] = []
+    epoch_checkpoints: list[Path] = []
     start_time = time.time()
 
     for epoch in range(1, args.epochs + 1):
@@ -276,6 +312,7 @@ def main() -> None:
             "train_total_loss": float(train_metrics.get("total_loss", 0.0)),
             "val_top1": float(val_metrics["top1_acc"]),
             "val_top5": float(val_metrics["top5_acc"]),
+            "val_blend_top1_top5": float(0.5 * val_metrics["top1_acc"] + 0.5 * val_metrics["top5_acc"]),
             "val_selected_alpha": float(val_metrics["selected_alpha"]),
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
@@ -300,11 +337,49 @@ def main() -> None:
             metrics=epoch_metrics,
         )
 
-        score = (float(val_metrics["top1_acc"]), float(val_metrics["top5_acc"]))
-        if score > best_score:
-            best_score = score
+        if args.save_every_epoch or args.keep_last_k > 0:
+            epoch_path = run_dir / f"epoch_{epoch:03d}.pt"
+            save_checkpoint(
+                epoch_path,
+                model_state=model.state_dict(),
+                optimizer_state=optimizer.state_dict(),
+                scheduler_state=scheduler.state_dict(),
+                config=config,
+                metrics=epoch_metrics,
+            )
+            epoch_checkpoints.append(epoch_path)
+            while args.keep_last_k > 0 and len(epoch_checkpoints) > args.keep_last_k:
+                stale = epoch_checkpoints.pop(0)
+                if stale.exists():
+                    stale.unlink()
+
+        selection = selection_score(val_metrics, selection_metric=args.selection_metric)
+        score_top1 = selection_score(val_metrics, selection_metric="top1")
+        score_top5 = selection_score(val_metrics, selection_metric="top5")
+        if selection > best_selection:
+            best_selection = selection
             save_checkpoint(
                 run_dir / "best.pt",
+                model_state=model.state_dict(),
+                optimizer_state=optimizer.state_dict(),
+                scheduler_state=scheduler.state_dict(),
+                config=config,
+                metrics=epoch_metrics,
+            )
+        if score_top1 > best_top1:
+            best_top1 = score_top1
+            save_checkpoint(
+                run_dir / "best_top1.pt",
+                model_state=model.state_dict(),
+                optimizer_state=optimizer.state_dict(),
+                scheduler_state=scheduler.state_dict(),
+                config=config,
+                metrics=epoch_metrics,
+            )
+        if score_top5 > best_top5:
+            best_top5 = score_top5
+            save_checkpoint(
+                run_dir / "best_top5.pt",
                 model_state=model.state_dict(),
                 optimizer_state=optimizer.state_dict(),
                 scheduler_state=scheduler.state_dict(),
@@ -318,6 +393,7 @@ def main() -> None:
             f"train_total={epoch_metrics['train_total_loss']:.4f} "
             f"val_top1={epoch_metrics['val_top1']:.4f} "
             f"val_top5={epoch_metrics['val_top5']:.4f} "
+            f"blend={epoch_metrics['val_blend_top1_top5']:.4f} "
             f"alpha={epoch_metrics['val_selected_alpha']:.2f} "
             f"elapsed={elapsed}"
         )

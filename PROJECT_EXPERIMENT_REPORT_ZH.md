@@ -1,6 +1,6 @@
 # Project1 EEG 项目实验全程说明
 
-更新时间：2026-04-20
+更新时间：2026-04-21
 
 这份文档面向两类读者：
 
@@ -8,7 +8,7 @@
 - 愿意继续接手实验的人，希望知道哪些路线有效、哪些路线已经被排除
 
 如果你只想先看结论，可以直接跳到“**先给最终结论**”一节。  
-如果你想看完整流水，**正式主账本**在 [EXPERIMENT_LOG.md](/home/xiaoh/DeepLearning/project1_eeg/EXPERIMENT_LOG.md)。截至这份报告更新时，主账本里一共有 56 条实验记录。  
+如果你想看完整流水，**正式主账本**在 [EXPERIMENT_LOG.md](/home/xiaoh/DeepLearning/project1_eeg/EXPERIMENT_LOG.md)。这份报告只抽取其中真正影响路线决策的关键实验。  
 [EXPERIMENT_LOG_hpc.md](/home/xiaoh/DeepLearning/project1_eeg/EXPERIMENT_LOG_hpc.md) 不是第二本正式账本，它只是 2026-04-20 从远端 HPC 工作目录拉回来的镜像副本，用来保留 A800 节点上的原始记录。
 
 ## 项目在做什么
@@ -76,27 +76,43 @@
 2. **最早的 prototype / residual-VAE reconstruction 虽然某些量化指标看起来不差，但生成图在肉眼上基本没有语义。**
    也就是说：它“在指标上像成功”，但“在图像上像失败”。
 
-3. **Kandinsky decoder 不是当前首要瓶颈。**
+3. **Kandinsky decoder 本身不是首要瓶颈，但“只靠纯 embedding、从噪声开始解码”也不是最终答案。**
    我们做过一个非常重要的 sanity check：直接用 ground-truth Kandinsky image embedding 去解码，`val64` 上能达到：
    - `eval_clip = 0.9973`
    - `eval_alex5 = 0.9824`
-   这说明 decoder 上限很高，当前更大的问题仍然在于“EEG 到 embedding 这一步还不够准”。
+   这说明 decoder 的语义能力很强。  
+   但后面的 img2img 实验又进一步说明：如果没有一个低层结构锚点，纯 embedding decode 的 `SSIM` 和 `pixcorr` 仍然偏弱，所以真正有效的做法是把“高层语义条件”和“低层图像起点”结合起来。
 
-4. **当前最值得保留的 reconstruction 主线，是“EEG -> Kandinsky image embedding -> Kandinsky decoder”。**
-   在这条线上，当前最好配置不是最慢的“高质量采样”，而是更快的 `predicted_v4_fast`。
+4. **当前最值得保留的 reconstruction 主线，已经从“纯 Kandinsky embedding decode”升级为“retrieval prototype init + predicted Kandinsky embedding 的 Kandinsky img2img”。**
+   也就是：
+   - retrieval backbone 先给出一个训练图 prototype，作为低层结构起点
+   - EEG predictor 再给出连续的 Kandinsky image embedding，作为高层语义条件
+   - Kandinsky decoder 从这个 prototype 加噪后的 latent 开始做 img2img denoise
 
-5. **在当前已经做过本地 decode 评估的配置里，最好的 reconstruction 结果是 `kandinsky_predicted_v4_fast`。**
-   在 `val64` 上：
-   - `eval_clip = 0.7078`
-   - `eval_alex5 = 0.8204`
-   在 full validation 上：
-   - `eval_clip = 0.6933`
-   - `eval_alex5 = 0.7993`
+5. **在目前已经跑完 `full test` 的配置里，最好的 reconstruction 结果是 `hpc_img2img_v4_s20_c4_g4p0_str035`。**
+   这个配置使用：
+   - 训练 checkpoint：`reconstruction_kandinsky_embed_v4_proxyselect`
+   - decoder：Kandinsky img2img
+   - init image：retrieval prototype
+   - sampling：`20 steps`, `4 candidates`, `guidance 4.0`, `strength 0.35`
 
-6. **在当前 `val64` 对比里，“直接检索一张最像的训练图，再把它当生成条件”不是更优路线。**
-   同样在 `val64` 上，`retrieval_top1` 条件版本只有：
-   - `eval_clip = 0.6612`
-   低于连续回归的 `predicted_v4_fast`。
+   它在 `val64` 上的结果是：
+   - `eval_clip = 0.7106`
+   - `eval_ssim = 0.3505`
+   - `eval_pixcorr = 0.0938`
+
+   它在本地 200-way `test` 上的结果是：
+   - `eval_clip = 0.7513`
+   - `eval_ssim = 0.3767`
+   - `eval_pixcorr = 0.1567`
+   - `eval_alex5 = 0.8489`
+
+6. **最近做的 SDXL pivot 证明了“prototype init + 现代 diffusion decoder”这类思路是可行的，但当前版本没有打赢 Kandinsky img2img 主线。**
+   `sdxl_turbo_proto_text_s4_g0p0_str050` 在本地 200-way `test` 上得到：
+   - `eval_clip = 0.6940`
+   - `eval_ssim = 0.3642`
+   - `eval_pixcorr = 0.1238`
+   它作为 sidecar 有研究价值，但目前不是提交主线。
 
 7. **最近尝试的 `rag_residual v1` 在当前实现下没有打赢 baseline。**
    问题不是脚本没跑通，而是模型结构学歪了：
@@ -109,11 +125,18 @@
    - 但把这个 encoder 迁移到当前 Kandinsky embedding reconstruction 主线时，proxy 指标显著弱于 `v4_proxyselect`
    - 即使改成“先冻 encoder、再小学习率解冻”的 staged finetune，也没有把它拉回 baseline 水平
 
-9. **从项目决策角度看，当前最重要的下一步不是优先换 decoder，也不是优先继续沿用当前这套 masked-pretrain 初始化，而是继续提高 EEG 到语义 embedding 的建模。**
+9. **新加的一条 `CLIP` target regression 小实验说明：目标表征的选择值得继续探索。**
+   `reconstruction_clip_embed_v1_proxyselect` 的 best proxy 已经达到：
+   - `val_subset_top1 = 0.0369`
+   - `val_subset_top5 = 0.1022`
+   这比当前 Kandinsky target 训练主线 `v4_proxyselect` 的 proxy 更高。  
+   但因为这条线还没接上一个比现主线更强的 decoder 路径，所以它现在只能算“有潜力的下一步”，还不是可直接替换的主线。
+
+10. **从项目决策角度看，当前最重要的下一步已经不是盲目再开新大分支，而是围绕现有 `Kandinsky img2img` 主线做提交级完善，并在这个框架里继续提升语义条件。**
 
 ## 一个容易混淆但必须先说清楚的点
 
-[EXPERIMENT_LOG.md](/home/xiaoh/DeepLearning/project1_eeg/EXPERIMENT_LOG.md) 里的 “Current Best Reconstruction” 仍然指向旧的 `prototype_topk4` 测试结果。  
+[EXPERIMENT_LOG.md](/home/xiaoh/DeepLearning/project1_eeg/EXPERIMENT_LOG.md) 里的 “Current Best Reconstruction” banner 可能会滞后于最新 HPC 结果。  
 这并不意味着那是我们现在最认可的主线。
 
 原因是：
@@ -334,7 +357,7 @@
 
 1. **decoder 不是首要瓶颈**
 2. **在当前 `val64` 对比里，continuous predicted embedding 优于 retrieval_top1**
-3. **当前最好的生成配置是 `predicted_v4_fast`**
+3. **在“纯 embedding decode”这条子路线里，当前最好的生成配置是 `predicted_v4_fast`**
 
 ### 阶段 F：最近的 RAG residual 尝试，以及为什么它失败了
 
@@ -507,6 +530,127 @@ best checkpoint 在 `epoch 22`，关键指标是：
 
 **“当前写法下的 masked-pretrain encoder 初始化”在现有 proxy-selected regression 设定下没有带来收益，因此不应作为 reconstruction 主线的优先方向继续推进。**
 
+### 阶段 H：把 prototype 重新放回生成链路，但只让它负责低层结构锚点
+
+前面阶段 C 之所以放弃 prototype-based reconstruction，是因为“把训练图 prototype 当成最终答案”这件事不对。  
+但这不代表 prototype 完全没用。
+
+后面重新梳理这个问题时，我把它拆成了两个层次：
+
+- **高层语义**：由 EEG predictor 回归出来的连续 Kandinsky image embedding 决定
+- **低层结构**：由 retrieval backbone 找到的 prototype 图来提供一个合理的初始图像
+
+这就得到了一条新的 img2img 路线：
+
+1. 用当前最好的 retrieval backbone 找到一个 top-1 prototype
+2. 把这张 prototype 图送入 Kandinsky img2img decoder
+3. 用 `reconstruction_kandinsky_embed_v4_proxyselect` 预测出的 image embedding 做 conditioning
+4. 通过 `strength` 控制“保留多少 prototype 低层结构、覆盖多少新语义”
+
+这条路线最重要的对比，不是“prototype 有用没用”，而是：
+
+**prototype 单独当答案没用，但 prototype 当低层锚点是有用的。**
+
+我先在 `val8_smoke` 上确认链路可跑，然后在 `val64` 上做了三档 `strength` sweep：
+
+| 配置 | `eval_clip` | `eval_ssim` | `eval_pixcorr` | 结论 |
+|---|---:|---:|---:|---|
+| `str035` | `0.7106` | `0.3505` | `0.0938` | 当前最好平衡点 |
+| `str050` | `0.7019` | `0.3136` | `0.0597` | 语义和结构都略退 |
+| `str065` | `0.6979` | `0.2964` | `0.0670` | 再往上也没有变好 |
+
+这里最重要的现象是：
+
+- 相比纯 decode 的 `kandinsky_predicted_v4_fast`，`str035` 的 `eval_clip` 没有明显变差
+- 但 `eval_ssim` 从 `0.0509` 大幅抬到了 `0.3505`
+- `eval_pixcorr` 也从 `0.0873` 提到了 `0.0938`
+
+换句话说：
+
+**把 prototype 放回 img2img 起点后，我们第一次在不明显牺牲语义的前提下，把低层结构指标拉了回来。**
+
+随后我把这条最优配置升到本地 200-way `test`：
+
+- 配置名：`hpc_img2img_v4_s20_c4_g4p0_str035`
+- `eval_clip = 0.7513`
+- `eval_ssim = 0.3767`
+- `eval_pixcorr = 0.1567`
+- `eval_alex5 = 0.8489`
+
+这也是到目前为止，**真正有 full-test 证据支持的 reconstruction 最佳主线**。
+
+### 阶段 I：并行验证 SDXL sidecar 和 CLIP-target 语义分支
+
+在确定“prototype init + semantic condition”这类思路可行之后，我又并行看了两件事：
+
+1. decoder 能不能从 Kandinsky 换到 SDXL
+2. 语义 target 能不能从 Kandinsky embedding 换到更标准的 CLIP embedding
+
+#### I.1 SDXL img2img feasibility branch
+
+这条线的目标不是立刻换主线，而是验证：
+
+**如果把当前 retrieval prototype 和一个轻量文本 prompt 一起送进 SDXL Turbo img2img，会不会比 Kandinsky 更强？**
+
+我先修了两类工程问题：
+
+- 远端脚本同步路径错误
+- retrieval bank 里 prototype 图像路径写的是旧的本地绝对路径，需要按 `image_id` 在当前数据目录里重新映射
+
+脚本跑通之后，在 `val64` 上的最好点是 `str050`：
+
+- `eval_clip = 0.6845`
+- `eval_ssim = 0.3574`
+- `eval_pixcorr = 0.1253`
+
+这个结果说明：
+
+- SDXL 这条 sidecar 不是跑不通
+- 它甚至在 `SSIM/pixcorr` 上是有竞争力的
+- 但它在语义指标上明显弱于 Kandinsky img2img
+
+最后把最优点升到本地 200-way `test` 后，结果是：
+
+- 配置名：`sdxl_turbo_proto_text_s4_g0p0_str050`
+- `eval_clip = 0.6940`
+- `eval_ssim = 0.3642`
+- `eval_pixcorr = 0.1238`
+- `eval_alex5 = 0.8155`
+
+它没有打赢 `hpc_img2img_v4_s20_c4_g4p0_str035`，因此结论很明确：
+
+**SDXL pivot 目前只适合作为 sidecar 研究分支，不适合作为当前提交主线。**
+
+#### I.2 CLIP target regression 小规模验证
+
+前面的 Kandinsky target 路线已经说明：
+
+- 这条思路能跑通
+- 但 target 本身是不是最好，仍然值得怀疑
+
+所以我补了一条更简单的语义 target 实验：
+
+- 模型：`reconstruction_clip_embed_v1_proxyselect`
+- 目标：直接从 EEG 回归 `CLIP` image embedding
+
+这条线的 best proxy 是：
+
+- `val_subset_top1 = 0.0369`
+- `val_subset_top5 = 0.1022`
+
+对比当前 Kandinsky target 的训练主线 `v4_proxyselect`：
+
+- `v4_proxyselect`: `val_subset_top1 = 0.0272`, `val_subset_top5 = 0.0846`
+- `clip_embed_v1`: `val_subset_top1 = 0.0369`, `val_subset_top5 = 0.1022`
+
+这说明：
+
+**从“语义可回归性”这个角度看，CLIP target 可能比 Kandinsky target 更容易学。**
+
+但这条线目前还没有接上一个完整、稳定、并且超过 Kandinsky img2img 主线的 decoder 路径，所以现在只能下一个稳妥结论：
+
+**CLIP target 是下一阶段最值得保留的语义分支，但它还没有形成新的提交级主线。**
+
 ## 除了模型本身，还做了哪些工程支撑
 
 如果只看模型名字，很容易忽视中间其实做了不少“为了让实验可跑、可比较、可复现”的基础工作。
@@ -546,12 +690,15 @@ best checkpoint 在 `epoch 22`，关键指标是：
 | Kandinsky 训练主线 | `reconstruction_kandinsky_embed_v4_proxyselect` | `val_subset_top1=0.0272`, `val_subset_top5=0.0846` | 当前最好训练 checkpoint |
 | sanity check | `kandinsky_groundtruth_local` | `val64 eval_clip=0.9973` | decoder 不是主要瓶颈 |
 | discrete retrieval 条件 | `kandinsky_retrieval_top1_local` | `val64 eval_clip=0.6612` | 离散 top1 不如连续预测 |
-| 当前最好 reconstruction | `kandinsky_predicted_v4_fast` | `val64 eval_clip=0.7078`, full-val `0.6933` | 当前最值得保留的 reconstruction 主线 |
+| 纯 decode 最好点 | `kandinsky_predicted_v4_fast` | `val64 eval_clip=0.7078`, `eval_ssim=0.0509`; full-val `eval_clip=0.6933`, `eval_ssim=0.1836` | 纯 embedding decode 里的最好配置 |
 | 慢速高采样对照 | `kandinsky_predicted_v4_quality` | `val64 eval_clip=0.6992` | 更慢不代表更好 |
+| Kandinsky img2img 主线 | `hpc_img2img_v4_s20_c4_g4p0_str035` | test `eval_clip=0.7513`, `eval_ssim=0.3767`, `eval_pixcorr=0.1567` | 当前 overall 最好 reconstruction 主线 |
+| SDXL sidecar | `sdxl_turbo_proto_text_s4_g0p0_str050` | test `eval_clip=0.6940`, `eval_ssim=0.3642` | 可行，但没打赢 Kandinsky img2img |
 | 新结构尝试 | `reconstruction_kandinsky_rag_residual_v1` | best `val_subset_top1=0.0254`, gate 近 0 | 跑通了，但没赢，也没真正用上 residual |
 | A800 预训练 | `eeg_mask_pretrain_v1` | best `val_total_loss=0.6766` | 预训练目标本身能收敛 |
 | A800 直接迁移 | `reconstruction_kandinsky_embed_v5_mask_pretrain_a800` | best `val_subset_top1=0.0006`, `val_subset_top5=0.0048` | 在当前 proxy 指标下明显弱于 baseline |
 | A800 保守迁移 | `reconstruction_kandinsky_embed_v6_mask_pretrain_staged_a800` | best `val_subset_top1=0.0030`, `val_subset_top5=0.0073` | 比直接迁移略好，但在当前 proxy 指标下仍远弱于 `v4_proxyselect` |
+| 新语义 target 探针 | `reconstruction_clip_embed_v1_proxyselect` | best `val_subset_top1=0.0369`, `val_subset_top5=0.1022` | CLIP target 更容易回归，值得保留 |
 
 ## 最重要的数字应该怎么读
 
@@ -619,7 +766,7 @@ best checkpoint 在 `epoch 22`，关键指标是：
 
 ## 当前最佳可用方案
 
-如果现在要把项目交给别人继续做，我会保留两条主线。
+如果现在要把项目交给别人继续做，我会保留一个 retrieval backbone、一个 reconstruction 主线，再加一个次级研究分支。
 
 ### A. Retrieval 当前最佳方案
 
@@ -637,25 +784,41 @@ best checkpoint 在 `epoch 22`，关键指标是：
 ### B. Reconstruction 当前最佳方案
 
 - 训练 checkpoint：`reconstruction_kandinsky_embed_v4_proxyselect`
-- 生成配置：`predicted_v4_fast`
+- 生成配置：`hpc_img2img_v4_s20_c4_g4p0_str035`
+  - `Kandinsky img2img`
+  - init image 来自 retrieval top-1 prototype
   - `20 steps`
   - `4 candidates`
   - `guidance 4.0`
+  - `strength 0.35`
 
 关键结果：
 
 - `val64`：
-  - `eval_clip = 0.7078`
-  - `eval_alex5 = 0.8204`
-- full validation：
-  - `eval_clip = 0.6933`
-  - `eval_alex5 = 0.7993`
+  - `eval_clip = 0.7106`
+  - `eval_ssim = 0.3505`
+  - `eval_pixcorr = 0.0938`
+- 本地 200-way `test`：
+  - `eval_clip = 0.7513`
+  - `eval_ssim = 0.3767`
+  - `eval_pixcorr = 0.1567`
+  - `eval_alex5 = 0.8489`
 
 为什么保留它：
 
-- 它是当前“语义最好 + 实际可跑 + 速度也合理”的 reconstruction 主线
-- 它明显优于 `retrieval_top1` 条件生成
-- 它也比 prototype/VAE 路线更符合当前数据设定
+- 它是当前唯一一个同时兼顾高层语义和低层结构、并且已经用 full test 验证过的 reconstruction 主线
+- 它比纯 decode 的 `predicted_v4_fast` 显著提高了 `SSIM`
+- 它也打赢了 SDXL sidecar 的 full-test 对照
+
+### C. 次级研究分支
+
+- `reconstruction_clip_embed_v1_proxyselect`
+
+为什么保留它：
+
+- 在训练 proxy 上，它已经超过当前 Kandinsky target 主线
+- 它说明“换 target 表征”这件事可能比继续堆复杂结构更有价值
+- 但它还没有接上一个稳定优于 `Kandinsky img2img` 的 decoder 路径，所以暂时不升为提交主线
 
 ## 已经排除或降级的路线
 
@@ -666,8 +829,13 @@ best checkpoint 在 `epoch 22`，关键指标是：
 不继续的原因：
 
 - train/test 类别不重叠
-- 用训练图原型去服务测试图，本身就不对题
+- 把训练图原型直接当最终答案，本身就不对题
 - 肉眼看生成图几乎没有清晰物体语义
+
+但要特别补一句：
+
+- **prototype 作为 img2img 的低层结构锚点要保留**
+- 被放弃的是“prototype 当独立 reconstruction 主线”，不是“prototype 在整个系统里彻底没用”
 
 ### 2. Residual VAE mainline
 
@@ -691,51 +859,82 @@ best checkpoint 在 `epoch 22`，关键指标是：
 - `avg_gate` 接近 0，说明 residual 分支实际没被用起来
 - 现阶段继续同配置长训没有意义
 
+### 5. 当前写法下的 masked-pretrain 初始化
+
+不继续作为近期主线的原因：
+
+- 已经在 A800 上做过正式迁移验证
+- 无论直接迁移还是 staged finetune，都明显弱于 `v4_proxyselect`
+- 在没有新目标函数或新迁移策略之前，继续沿这条线堆算力的性价比很低
+
 ## 下一步最值得做什么
 
-当前最合理的顺序不是“乱开更多实验”，而是按因果关系推进。
+当前最合理的顺序不是“重新把所有分支都开一遍”，而是围绕已经打赢 full test 的主线继续推进。
 
-### 优先级 1：继续提升 EEG 表征，但不宜优先继续沿用当前这套 masked-pretrain 初始化
+### 当前进行中的实验
 
-当前最明确的事实有两个：
+截至这份文档更新并准备同步到 GitHub 时，当前已经正式提交到 HKUST-GZ HPC、但还在排队中的实验有两条：
 
-- `rag_residual` 的 gate collapse 还没解决
-- 当前这套 masked-pretrain 初始化在现有 proxy regression 设定下也没有带来收益
+1. `retrieval_dreamsim_only_atm_base_v1`
+   - 目标：验证把 retrieval backbone 从 `atm_small` 升到 `atm_base` 后，是否能直接提高本地 200-way retrieval 上限
+   - 当前状态：`PENDING (Priority)`
+   - 关键改动：`encoder_type=atm_base`，并把 checkpoint selection 改成更鲁棒的 `blend_top1_top5`
 
-所以真正要解决的是：
+2. `retrieval_dreamsim_only_atm_base_ides_v1`
+   - 目标：验证 IDES-style 的随机 trial averaging 是否能进一步提高 retrieval 上限
+   - 当前状态：`PENDING (Priority)`
+   - 关键改动：在同样的 `atm_base` backbone 上，训练时随机从 4 个 trial 中抽取 `k=2..4` 个做平均，而不是固定平均
 
-- 怎样让 EEG encoder 学到更适合下游语义回归的表示
-- 而不是优先继续复用这套已经表现不佳的 masked reconstruction 目标
+这两条 retrieval run 都属于“性能上限冲刺”的第一阶段。  
+如果它们拿到比当前 `retrieval_dreamsim_only_atm_small_fixed` 更好的结果，那么现有的 `Kandinsky img2img` reconstruction 主线会自动受益，因为 prototype init 会直接变得更准。
 
-### 优先级 2：修 residual gate collapse，或者换一个更合理的 auxiliary objective
+### 优先级 1：把 `Kandinsky img2img` 主线当成正式提交版本继续做完善
 
-如果还要继续做结构增强，最值得追的是：
+原因很简单：
 
-- 为什么 gate 学成了几乎全关
-- 怎么让 retrieval residual 真正参与 final embedding
-- 或者干脆换一个比 masked temporal reconstruction 更贴近下游目标的辅助学习信号
+- 它已经在 full test 上打赢了当前所有已完成对照
+- 它第一次把“高语义”和“较强低层结构”放在同一条线里
+- 再往前推进，应该优先做这条线的多 seed、样例整理、提交级打磨
 
-在这个问题没解决之前，继续长训同一类 `rag_residual` 或 masked-pretrain 变体，性价比都不高。
+### 优先级 2：在现有 img2img 框架里继续提升语义条件，而不是优先换 decoder
 
-### 优先级 3：再尝试 text aux / text context
+当前最值得继续追的方向是：
 
-这条线有潜力，但要放在 gate 问题之后：
+- 更好的 EEG -> semantic target 回归
+- 更合理的 target 表征选择
+- 继续利用 prototype 作为低层锚点，而不是把它重新升回独立主线
 
-- 因为目前 `concept_text` 本质上只是类别词，不是完整 caption
-- 所以它更像辅助语义，而不是主生成条件
+按当前执行顺序，这一层不会先于 retrieval 做。  
+更具体地说，接下来的路线是：
 
-### 优先级 4：如果以后再回到 pretraining，必须换目标或换数据规模
+1. 先等 `atm_base / atm_base + IDES` 这两条 retrieval run 出结果
+2. 如果 retrieval 有增益，先用新的 retrieval backbone 重跑现有 `Kandinsky img2img` 主线，测 prototype 质量提升带来的级联收益
+3. 只有在这个级联收益吃完之后，再进入 `CLIP target` 训练和更复杂的 decoder / target-space 实验
+
+这也是为什么 `CLIP target` 分支值得保留：
+
+- 它提示“换 target”可能比“换大 decoder”更有价值
+- 但它应该先接入现有的 img2img 框架里验证，而不是另起一套完全平行的提交路线
+
+### 优先级 3：SDXL 保留为 sidecar，不再作为近期第一优先级 pivot
+
+原因是：
+
+- feasibility 已经验证完了
+- full-test 对照已经说明它目前不如 Kandinsky img2img
+- 在没有更强 prompt / adapter / conditioning 设计之前，不值得抢占主线资源
+
+### 优先级 4：`rag_residual` 和 masked-pretrain 暂时降级，除非前提条件改变
 
 现在至少可以明确说：
 
-- 不是“还没来得及测 masked pretraining”
-- 而是“当前这套实现已经测过，而且在现有 proxy 设定下没打赢 baseline”
+- 不是“这些路线还没来得及测”
+- 而是“当前写法已经测过，而且没有赢”
 
-所以如果未来要重新做 pretraining，至少应该满足下面之一：
+所以如果以后还要回到这两条线，至少要先满足下面之一：
 
-- 换一个更贴近下游语义回归的预训练目标
-- 引入更大规模或更多样的 EEG 语料
-- 明确设计一套不会把有用表征在 finetune 初期冲掉的迁移方案
+- `rag_residual` 方面：先明确怎么避免 gate collapse
+- pretraining 方面：先换一个更贴近下游语义回归的预训练目标，或者明确新的迁移策略
 
 ## 附录：重要文件和目录地图
 
@@ -756,13 +955,33 @@ best checkpoint 在 `epoch 22`，关键指标是：
 
 - [best.pt](/home/xiaoh/DeepLearning/project1_eeg/outputs/experiments/reconstruction_kandinsky_embed_v4_proxyselect/seed_0/best.pt)
 
-### 当前最好 reconstruction 的 `val64` 对比结果
+### 当前最好 reconstruction 的 `val64` 对比结果（纯 decode 参考）
 
 - [reconstruction_metrics.json](/home/xiaoh/DeepLearning/project1_eeg/outputs/eval_compare/val64_seed0/kandinsky_predicted_v4_fast/reconstruction_metrics.json)
 
-### 当前最好 reconstruction 的 full validation 结果
+### 当前最好 reconstruction 的 full validation 结果（纯 decode 参考）
 
 - [reconstruction_metrics.json](/home/xiaoh/DeepLearning/project1_eeg/outputs/eval_compare/full_val_seed0/kandinsky_predicted_v4_fast/reconstruction_metrics.json)
+
+### 当前最好 reconstruction 的 full-test 主线结果
+
+- 配置：`hpc_img2img_v4_s20_c4_g4p0_str035`
+- 远端输出目录：`/hpc2ssd/JH_DATA/spooler/dsaa2012_054/DeepLearning/project1_eeg/outputs/eval_compare/test_seed0/hpc_img2img_v4_s20_c4_g4p0_str035`
+- 关键指标：
+  - `eval_clip = 0.7513`
+  - `eval_ssim = 0.3767`
+  - `eval_pixcorr = 0.1567`
+  - `eval_alex5 = 0.8489`
+
+### SDXL sidecar 的 full-test 对照结果
+
+- 配置：`sdxl_turbo_proto_text_s4_g0p0_str050`
+- 远端输出目录：`/hpc2ssd/JH_DATA/spooler/dsaa2012_054/DeepLearning/project1_eeg/outputs/eval_compare/test_seed0/sdxl_turbo_proto_text_s4_g0p0_str050`
+- 关键指标：
+  - `eval_clip = 0.6940`
+  - `eval_ssim = 0.3642`
+  - `eval_pixcorr = 0.1238`
+  - `eval_alex5 = 0.8155`
 
 ### 旧 prototype / VAE baseline
 
@@ -778,8 +997,15 @@ best checkpoint 在 `epoch 22`，关键指标是：
 - 直接迁移：[best.pt](/data/xiaoh/DeepLearning_storage/project1_eeg/outputs/experiments/reconstruction_kandinsky_embed_v5_mask_pretrain_a800/seed_0/best.pt)
 - 保守 staged 迁移：[best.pt](/data/xiaoh/DeepLearning_storage/project1_eeg/outputs/experiments/reconstruction_kandinsky_embed_v6_mask_pretrain_staged_a800/seed_0/best.pt)
 
+### 值得继续看的 CLIP target 分支
+
+- 输出目录：`/hpc2ssd/JH_DATA/spooler/dsaa2012_054/DeepLearning/project1_eeg/outputs/experiments/reconstruction_clip_embed_v1_proxyselect/seed_0`
+- 关键 proxy：
+  - `val_subset_top1 = 0.0369`
+  - `val_subset_top5 = 0.1022`
+
 ---
 
 如果只用一句话总结整个项目到现在的状态，那就是：
 
-**检索已经做出了一个可靠版本；重建已经从“看似有指标、其实没语义”的旧 baseline，推进到了“有一定语义、但还不够准”的 Kandinsky embedding 主线；2026-04-20 的 A800 实验进一步说明，当前这套 masked-pretrain 初始化至少在现有 proxy-selected regression 设定下没有把这条主线救起来，下一步真正该解决的仍然是 EEG 到高层语义表示的建模质量。**
+**检索已经做出了一个可靠版本；重建也已经从“prototype 单独成图没语义”的旧 baseline，推进到了“prototype 负责低层结构、predicted embedding 负责高层语义”的 Kandinsky img2img 主线，而且这条线已经在本地 full test 上打赢了当前所有已完成对照；接下来真正该做的，不是重新散开战线，而是在这条主线里继续提升语义条件并完成提交级整理。**

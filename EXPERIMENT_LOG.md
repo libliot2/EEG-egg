@@ -13,12 +13,12 @@ This file is the project-wide experiment ledger. Use `scripts/log_experiment.py`
 
 ## Current Best Reconstruction
 <!-- BEST_RECONSTRUCTION_START -->
-- Attempt ID: `EXP-20260418-204523-reconstruction-topk4-test`
+- Attempt ID: `EXP-20260421-reconstruction-kandinsky-img2img-test`
 - Scope: `test`
-- Output Dir: `/data/xiaoh/DeepLearning_storage/project1_eeg/outputs/experiments/reconstruction_dreamsim_topk4/seed_0/test_predictions`
-- Metrics: `eval_clip=0.5386`, `eval_ssim=0.4326`, `eval_pixcorr=0.2136`
-- Goal: Generate and evaluate test reconstructions for the score-weighted top-k=4 residual model.
-- Qualitative Caveat: see `Open Issues`; the current best quantitative run is still visually unreliable.
+- Output Dir: `/hpc2ssd/JH_DATA/spooler/dsaa2012_054/DeepLearning/project1_eeg/outputs/eval_compare/test_seed0/hpc_img2img_v4_s20_c4_g4p0_str035`
+- Metrics: `eval_clip=0.7513`, `eval_ssim=0.3767`, `eval_pixcorr=0.1567`, `eval_alex5=0.8489`
+- Goal: Evaluate the current Kandinsky img2img mainline that uses retrieval prototype init plus predicted Kandinsky embedding conditioning.
+- Note: this is the current best overall reconstruction mainline by combined semantic quality and structural similarity, even though the old prototype-only baseline still had higher raw SSIM.
 <!-- BEST_RECONSTRUCTION_END -->
 
 ## Open Issues
@@ -28,8 +28,214 @@ This file is the project-wide experiment ledger. Use `scripts/log_experiment.py`
 - The current `train prototype + residual VAE` reconstruction path is not a promising mainline and should only be kept as a baseline.
 <!-- OPEN_ISSUES_END -->
 
+## Current Running Experiments
+
+- `9701725` `p1_r_atm_b`: queued on HKUST-GZ HPC (`i64m1tga800ue`), training `retrieval_dreamsim_only_atm_base_v1` with robust checkpoint selection (`blend_top1_top5`) and last-5 checkpoint retention.
+- `9701726` `p1_r_ides`: queued on HKUST-GZ HPC (`i64m1tga800ue`), training `retrieval_dreamsim_only_atm_base_ides_v1` with the same ATM-base backbone plus random trial averaging (`k=2..4`).
+
 ## Experiment Entries
 <!-- LOG_ENTRIES_START -->
+### EXP-20260421-125412-retrieval-atm-base-v1 [started]
+<!-- log-meta: {"area":"retrieval","attempt_id":"EXP-20260421-125412-retrieval-atm-base-v1","backfilled":false,"best_decoder_eval":null,"best_embedding_proxy":null,"command":"sbatch retrieval_atm_base_v1.sbatch (job 9701725)","goal":"Train DreamSim-only ATM-base retrieval baseline with robust checkpoint selection.","key_inputs":["encoder_type=atm_base","hidden_dim=384, embedding_dim=1024","transformer_layers=4, transformer_heads=8","selection_metric=blend_top1_top5","keep_last_k=5"],"kind":"train","metric_scope":"val","metric_source":null,"metrics":{},"next_action":"Wait for the queued HPC job to start, then compare its best-by-blend checkpoint against retrieval_dreamsim_only_atm_small_fixed.","observations":["The first submission used stale remote code paths, so it was cancelled and resubmitted as job 9701725 after rsyncing the updated retrieval/data modules to the correct remote paths.","Current HPC scheduler state: PENDING (Priority)."],"output_dir":"/hpc2ssd/JH_DATA/spooler/dsaa2012_054/DeepLearning/project1_eeg/outputs/experiments/retrieval_dreamsim_only_atm_base_v1","selected_decoder_eval":null,"selected_embedding_proxy":null,"selected_epoch":null,"selection_metric":"blend_top1_top5","status":"started","timestamp":"2026-04-21T12:54:12+08:00"} -->
+
+- Timestamp: 2026-04-21T12:54:12+08:00
+- Area: retrieval
+- Kind: train
+- Goal: Train DreamSim-only ATM-base retrieval baseline with robust checkpoint selection.
+- Metric Scope: val
+- Metric Source: None
+- Output Dir: /hpc2ssd/JH_DATA/spooler/dsaa2012_054/DeepLearning/project1_eeg/outputs/experiments/retrieval_dreamsim_only_atm_base_v1
+- Backfilled: no
+
+#### Command
+```bash
+sbatch retrieval_atm_base_v1.sbatch (job 9701725)
+```
+
+#### Key Inputs
+- encoder_type=atm_base
+- hidden_dim=384, embedding_dim=1024
+- transformer_layers=4, transformer_heads=8
+- selection_metric=blend_top1_top5
+- keep_last_k=5
+
+#### Metrics
+- None
+
+#### Selection Summary
+- None
+
+#### Observations
+- The first submission used stale remote code paths, so it was cancelled and resubmitted as job `9701725` after rsyncing the updated retrieval/data modules to the correct remote paths.
+- Current HPC scheduler state: `PENDING (Priority)`.
+
+#### Next Action
+Wait for the queued HPC job to start, then compare its best-by-blend checkpoint against `retrieval_dreamsim_only_atm_small_fixed`.
+
+### EXP-20260421-125412-retrieval-atm-base-ides-v1 [started]
+<!-- log-meta: {"area":"retrieval","attempt_id":"EXP-20260421-125412-retrieval-atm-base-ides-v1","backfilled":false,"best_decoder_eval":null,"best_embedding_proxy":null,"command":"sbatch retrieval_atm_base_ides_v1.sbatch (job 9701726)","goal":"Train ATM-base retrieval with random trial averaging (IDES-style) on DreamSim target.","key_inputs":["encoder_type=atm_base","trial_sampling=random_avg, k=2..4","selection_metric=blend_top1_top5","keep_last_k=5"],"kind":"train","metric_scope":"val","metric_source":null,"metrics":{},"next_action":"Wait for the queued HPC job to start, then compare whether trial-sampling beats the plain ATM-base retrieval run on the same blend selection rule.","observations":["The first submission used stale remote code paths, so it was cancelled and resubmitted as job 9701726 after rsyncing the updated retrieval/data modules to the correct remote paths.","Current HPC scheduler state: PENDING (Priority)."],"output_dir":"/hpc2ssd/JH_DATA/spooler/dsaa2012_054/DeepLearning/project1_eeg/outputs/experiments/retrieval_dreamsim_only_atm_base_ides_v1","selected_decoder_eval":null,"selected_embedding_proxy":null,"selected_epoch":null,"selection_metric":"blend_top1_top5","status":"started","timestamp":"2026-04-21T12:54:12+08:00"} -->
+
+- Timestamp: 2026-04-21T12:54:12+08:00
+- Area: retrieval
+- Kind: train
+- Goal: Train ATM-base retrieval with random trial averaging (IDES-style) on DreamSim target.
+- Metric Scope: val
+- Metric Source: None
+- Output Dir: /hpc2ssd/JH_DATA/spooler/dsaa2012_054/DeepLearning/project1_eeg/outputs/experiments/retrieval_dreamsim_only_atm_base_ides_v1
+- Backfilled: no
+
+#### Command
+```bash
+sbatch retrieval_atm_base_ides_v1.sbatch (job 9701726)
+```
+
+#### Key Inputs
+- encoder_type=atm_base
+- trial_sampling=random_avg, k=2..4
+- selection_metric=blend_top1_top5
+- keep_last_k=5
+
+#### Metrics
+- None
+
+#### Selection Summary
+- None
+
+#### Observations
+- The first submission used stale remote code paths, so it was cancelled and resubmitted as job `9701726` after rsyncing the updated retrieval/data modules to the correct remote paths.
+- Current HPC scheduler state: `PENDING (Priority)`.
+
+#### Next Action
+Wait for the queued HPC job to start, then compare whether trial-sampling beats the plain ATM-base retrieval run on the same blend selection rule.
+
+### EXP-20260420-163059-reconstruction [started]
+<!-- log-meta: {"area":"reconstruction","attempt_id":"EXP-20260420-163059-reconstruction","backfilled":false,"best_decoder_eval":null,"best_embedding_proxy":null,"command":"sbatch hpc_img2img_val64_strength_long (array 0-2%2)","goal":"Queue val64 img2img strength sweep on HKUST-GZ HPC","key_inputs":[],"kind":"ablation","metric_scope":"unknown","metric_source":null,"metrics":{},"next_action":null,"observations":[],"output_dir":null,"selected_decoder_eval":null,"selected_embedding_proxy":null,"selected_epoch":null,"selection_metric":null,"status":"started","timestamp":"2026-04-20T16:30:59+08:00"} -->
+
+- Timestamp: 2026-04-20T16:30:59+08:00
+- Area: reconstruction
+- Kind: ablation
+- Goal: Queue val64 img2img strength sweep on HKUST-GZ HPC
+- Metric Scope: unknown
+- Metric Source: None
+- Output Dir: None
+- Backfilled: no
+
+#### Command
+```bash
+sbatch hpc_img2img_val64_strength_long (array 0-2%2)
+```
+
+#### Key Inputs
+- None
+
+#### Metrics
+- None
+
+#### Selection Summary
+- None
+
+#### Observations
+- None
+
+#### Next Action
+None
+
+### EXP-20260420-163055-reconstruction [started]
+<!-- log-meta: {"area":"reconstruction","attempt_id":"EXP-20260420-163055-reconstruction","backfilled":false,"best_decoder_eval":null,"best_embedding_proxy":null,"command":"sbatch hpc_val8_prototype_init_long -> hpc_img2img_smoke_long","goal":"Queue val8 prototype init + img2img smoke on HKUST-GZ HPC","key_inputs":[],"kind":"smoke","metric_scope":"unknown","metric_source":null,"metrics":{},"next_action":null,"observations":[],"output_dir":null,"selected_decoder_eval":null,"selected_embedding_proxy":null,"selected_epoch":null,"selection_metric":null,"status":"started","timestamp":"2026-04-20T16:30:55+08:00"} -->
+
+- Timestamp: 2026-04-20T16:30:55+08:00
+- Area: reconstruction
+- Kind: smoke
+- Goal: Queue val8 prototype init + img2img smoke on HKUST-GZ HPC
+- Metric Scope: unknown
+- Metric Source: None
+- Output Dir: None
+- Backfilled: no
+
+#### Command
+```bash
+sbatch hpc_val8_prototype_init_long -> hpc_img2img_smoke_long
+```
+
+#### Key Inputs
+- None
+
+#### Metrics
+- None
+
+#### Selection Summary
+- None
+
+#### Observations
+- None
+
+#### Next Action
+None
+
+### EXP-20260420-142948-reconstruction-d0-sweep [started]
+<!-- log-meta: {"area":"reconstruction","attempt_id":"EXP-20260420-142948-reconstruction-d0-sweep","backfilled":false,"best_decoder_eval":null,"best_embedding_proxy":null,"command":"sbatch array D0 decoder sweep (6 configs, %2 concurrency)","goal":"HPC D0 decoder micro-sweep for v4_proxyselect on val64 with 2xA800","key_inputs":[],"kind":"ablation","metric_scope":"unknown","metric_source":null,"metrics":{},"next_action":null,"observations":[],"output_dir":null,"selected_decoder_eval":null,"selected_embedding_proxy":null,"selected_epoch":null,"selection_metric":null,"status":"started","timestamp":"2026-04-20T14:29:48+08:00"} -->
+
+- Timestamp: 2026-04-20T14:29:48+08:00
+- Area: reconstruction
+- Kind: ablation
+- Goal: HPC D0 decoder micro-sweep for v4_proxyselect on val64 with 2xA800
+- Metric Scope: unknown
+- Metric Source: None
+- Output Dir: None
+- Backfilled: no
+
+#### Command
+```bash
+sbatch array D0 decoder sweep (6 configs, %2 concurrency)
+```
+
+#### Key Inputs
+- None
+
+#### Metrics
+- None
+
+#### Selection Summary
+- None
+
+#### Observations
+- None
+
+#### Next Action
+None
+
+### EXP-20260420-142948-reconstruction-hpc-smoke [started]
+<!-- log-meta: {"area":"reconstruction","attempt_id":"EXP-20260420-142948-reconstruction-hpc-smoke","backfilled":false,"best_decoder_eval":null,"best_embedding_proxy":null,"command":"sbatch hpc warmup+smoke v4 val8 on A800","goal":"HPC warmup + v4 smoke decode on val8","key_inputs":[],"kind":"smoke","metric_scope":"unknown","metric_source":null,"metrics":{},"next_action":null,"observations":[],"output_dir":null,"selected_decoder_eval":null,"selected_embedding_proxy":null,"selected_epoch":null,"selection_metric":null,"status":"started","timestamp":"2026-04-20T14:29:48+08:00"} -->
+
+- Timestamp: 2026-04-20T14:29:48+08:00
+- Area: reconstruction
+- Kind: smoke
+- Goal: HPC warmup + v4 smoke decode on val8
+- Metric Scope: unknown
+- Metric Source: None
+- Output Dir: None
+- Backfilled: no
+
+#### Command
+```bash
+sbatch hpc warmup+smoke v4 val8 on A800
+```
+
+#### Key Inputs
+- None
+
+#### Metrics
+- None
+
+#### Selection Summary
+- None
+
+#### Observations
+- None
+
+#### Next Action
+None
+
 ### EXP-20260420-113124-reconstruction [success]
 <!-- log-meta: {"area":"reconstruction","attempt_id":"EXP-20260420-113124-reconstruction","backfilled":true,"best_decoder_eval":null,"best_embedding_proxy":null,"command":"/hpc2hdd/home/dsaa2012_054/jhspoolers/DeepLearning/.conda-envs/project1-eeg/bin/python scripts/train_reconstruction_embed.py --retrieval-checkpoint outputs/experiments/retrieval_dreamsim_only_atm_small_fixed/seed_0/best.pt --pretrain-checkpoint outputs/experiments/eeg_mask_pretrain_v1/seed_0/encoder_best.pt --embedding-bank outputs/cache/kandinsky_train.pt --output-dir outputs/experiments/reconstruction_kandinsky_embed_v6_mask_pretrain_staged_a800 --epochs 30 --batch-size 64 --num-workers 8 --embedding-eval-every 1 --selection-metric val_subset_top1_then_top5 --image-eval-every 0 --image-eval-limit 0 --staged-regression-finetune --freeze-encoder-epochs 5 --encoder-learning-rate 3e-5 --head-learning-rate 3e-4 --device cuda","goal":"Fine-tune Kandinsky embedding regression with staged head-first optimization from a masked-pretrained EEG encoder on HKUST-GZ HPC A800.","key_inputs":["staged_regression_finetune=true","freeze_encoder_epochs=5","encoder_lr=3e-5 head_lr=3e-4"],"kind":"train","metric_scope":"val","metric_source":null,"metrics":{},"next_action":"Do not promote masked-pretrain initialization to the reconstruction mainline; return to stronger representation ideas or a different auxiliary objective.","observations":["Backfilled from the April 20 A800 HPC run.","Staged finetuning was better than direct finetuning but still far below the v4_proxyselect baseline, so masked-pretrain initialization remains a negative result."],"output_dir":"/data/xiaoh/DeepLearning_storage/project1_eeg/outputs/experiments/reconstruction_kandinsky_embed_v6_mask_pretrain_staged_a800","selected_decoder_eval":null,"selected_embedding_proxy":null,"selected_epoch":null,"selection_metric":null,"status":"success","timestamp":"2026-04-20T11:54:41+08:00"} -->
 
@@ -2016,5 +2222,38 @@ python scripts/log_experiment.py ...
 
 #### Next Action
 None
+
+### EXP-20260420-193152-reconstruction-sdxl-feasibility-smoke [started]
+<!-- log-meta: {"area":"reconstruction","attempt_id":"EXP-20260420-193152-reconstruction-sdxl-feasibility-smoke","backfilled":false,"command":"sbatch outputs/tmp/hpc_sdxl_val8_smoke_long.sbatch","goal":"Queue an SDXL img2img feasibility smoke run that uses retrieval prototypes as init images and prototype text as prompts.","key_inputs":["scripts/predict_reconstruction_sdxl_img2img.py","outputs/experiments/retrieval_dreamsim_only_atm_small_fixed/seed_0/best.pt","outputs/cache/dreamsim_train.pt","outputs/subsets/val8_smoke_seed0.json"],"kind":"smoke","metric_scope":"val8","metric_source":"pending","metrics":{},"next_action":"Wait for the HPC smoke job to finish, then inspect download/runtime cost and the first SDXL feasibility metrics.","observations":["Added a dedicated SDXL img2img feasibility script instead of modifying the existing Kandinsky inference path.","Submitted HPC job 9700621 on long_gpu with stabilityai/sdxl-turbo, prototype_text prompts, 4 denoising steps, and strength 0.4."],"output_dir":"/hpc2ssd/JH_DATA/spooler/dsaa2012_054/DeepLearning/project1_eeg/outputs/eval_compare/val8_smoke_seed0/sdxl_turbo_proto_text_s4_g0p0_str040","status":"started","timestamp":"2026-04-20T19:31:52+08:00"} -->
+
+- Timestamp: 2026-04-20T19:31:52+08:00
+- Area: reconstruction
+- Kind: smoke
+- Goal: Queue an SDXL img2img feasibility smoke run that uses retrieval prototypes as init images and prototype text as prompts.
+- Metric Scope: val8
+- Metric Source: pending
+- Output Dir: /hpc2ssd/JH_DATA/spooler/dsaa2012_054/DeepLearning/project1_eeg/outputs/eval_compare/val8_smoke_seed0/sdxl_turbo_proto_text_s4_g0p0_str040
+- Backfilled: no
+
+#### Command
+```bash
+sbatch outputs/tmp/hpc_sdxl_val8_smoke_long.sbatch
+```
+
+#### Key Inputs
+- scripts/predict_reconstruction_sdxl_img2img.py
+- outputs/experiments/retrieval_dreamsim_only_atm_small_fixed/seed_0/best.pt
+- outputs/cache/dreamsim_train.pt
+- outputs/subsets/val8_smoke_seed0.json
+
+#### Metrics
+- None
+
+#### Observations
+- Added a dedicated SDXL img2img feasibility script instead of modifying the existing Kandinsky inference path.
+- Submitted HPC job `9700621` on `long_gpu` with `stabilityai/sdxl-turbo`, `prototype_text` prompts, `4` denoising steps, and `strength=0.4`.
+
+#### Next Action
+Wait for the HPC smoke job to finish, then inspect download/runtime cost and the first SDXL feasibility metrics.
 
 <!-- LOG_ENTRIES_END -->

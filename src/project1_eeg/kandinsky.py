@@ -109,6 +109,27 @@ def load_kandinsky_decoder_pipeline(
     return pipe
 
 
+def load_kandinsky_img2img_decoder_pipeline(
+    *,
+    model_name: str = DEFAULT_KANDINSKY_DECODER_MODEL,
+    device: str | torch.device | None = None,
+    local_files_only: bool = False,
+):
+    from diffusers import KandinskyV22Img2ImgPipeline
+
+    device_obj = resolve_device(device)
+    resolved_model_name = resolve_local_hf_model_path(model_name, local_files_only=local_files_only)
+    pipe = KandinskyV22Img2ImgPipeline.from_pretrained(
+        resolved_model_name,
+        torch_dtype=kandinsky_torch_dtype(device_obj),
+        local_files_only=local_files_only,
+    )
+    pipe = pipe.to(device_obj)
+    pipe.enable_attention_slicing()
+    pipe.set_progress_bar_config(disable=True)
+    return pipe
+
+
 def _encoder_device_dtype(pipe) -> tuple[torch.device, torch.dtype]:
     parameter = next(pipe.image_encoder.parameters())
     return parameter.device, parameter.dtype
@@ -201,6 +222,8 @@ def generate_candidate_images(
     guidance_scale: float,
     height: int,
     width: int,
+    init_images: torch.Tensor | None = None,
+    strength: float = 0.3,
 ) -> torch.Tensor:
     candidate_seeds = list(candidate_seeds)
     if not candidate_seeds:
@@ -210,20 +233,29 @@ def generate_candidate_images(
     dtype = next(decoder_pipe.unet.parameters()).dtype
     condition = image_embeds.to(device=device, dtype=dtype)
     negatives = negative_image_embeds.to(device=device, dtype=dtype)
+    init_batch = None
+    if init_images is not None:
+        init_batch = init_images.to(device=device, dtype=dtype)
 
     candidate_images: list[torch.Tensor] = []
     generator_device = device.type if device.type == "cuda" else "cpu"
     for seed in candidate_seeds:
         generator = torch.Generator(device=generator_device).manual_seed(int(seed))
+        decoder_kwargs = {
+            "image_embeds": condition,
+            "negative_image_embeds": negatives,
+            "height": height,
+            "width": width,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "generator": generator,
+            "output_type": "pt",
+        }
+        if init_batch is not None:
+            decoder_kwargs["image"] = init_batch
+            decoder_kwargs["strength"] = strength
         output = decoder_pipe(
-            image_embeds=condition,
-            negative_image_embeds=negatives,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            output_type="pt",
+            **decoder_kwargs,
         )
         candidate_images.append(output.images.float().cpu())
 
@@ -270,8 +302,11 @@ def generate_best_images(
     guidance_scale: float = 4.0,
     height: int = 512,
     width: int = 512,
+    init_images: torch.Tensor | None = None,
+    img2img_strength: float = 0.3,
+    candidate_seed_offset: int = 0,
 ) -> dict[str, torch.Tensor | list[int]]:
-    candidate_seeds = list(range(num_candidates))
+    candidate_seeds = list(range(candidate_seed_offset, candidate_seed_offset + num_candidates))
     negatives = negative_image_embeds
     if negatives.shape[0] == 1 and predicted_embeddings.shape[0] > 1:
         negatives = negatives.repeat(predicted_embeddings.shape[0], 1)
@@ -285,6 +320,8 @@ def generate_best_images(
         guidance_scale=guidance_scale,
         height=height,
         width=width,
+        init_images=init_images,
+        strength=img2img_strength,
     )
     selected_images, selected_indices, selected_scores, candidate_scores = select_best_candidate_images(
         prior_pipe,
@@ -300,4 +337,5 @@ def generate_best_images(
         "selected_scores": selected_scores,
         "candidate_scores": candidate_scores,
         "candidate_seeds": candidate_seeds,
+        "generation_mode": "img2img" if init_images is not None else "text2img",
     }

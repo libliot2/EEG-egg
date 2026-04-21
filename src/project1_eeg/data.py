@@ -14,6 +14,7 @@ from .utils import DEFAULT_DATA_DIR, load_json
 
 SplitName = Literal["train", "test"]
 ImageIdSource = Literal["all", "train_ids", "val_ids"]
+TrialSamplingMode = Literal["none", "random_avg"]
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ def load_eeg_records(
     data_dir: str | Path = DEFAULT_DATA_DIR,
     split: SplitName,
     avg_trials: bool = True,
+    preserve_trials: bool = False,
     selected_channels: str | Sequence[str] | None = None,
     eeg_channel_jsonl: str | Path | None = None,
     image_ids: Iterable[str] | None = None,
@@ -93,8 +95,15 @@ def load_eeg_records(
     texts = loaded.get("text")
 
     if eeg.ndim == 4:
+        if avg_trials and preserve_trials:
+            raise ValueError("avg_trials and preserve_trials cannot both be enabled.")
         if avg_trials:
             eeg = eeg.mean(dim=1)
+            labels = labels[:, 0] if labels.ndim == 2 else labels
+            images = images[:, 0] if getattr(images, "ndim", 1) == 2 else images
+            if texts is not None and getattr(texts, "ndim", 1) == 2:
+                texts = texts[:, 0]
+        elif preserve_trials:
             labels = labels[:, 0] if labels.ndim == 2 else labels
             images = images[:, 0] if getattr(images, "ndim", 1) == 2 else images
             if texts is not None and getattr(texts, "ndim", 1) == 2:
@@ -178,16 +187,43 @@ def load_split_image_ids(
 
 
 class EEGImageDataset(Dataset[dict[str, torch.Tensor | str | int]]):
-    def __init__(self, records: Sequence[EEGRecord]) -> None:
+    def __init__(
+        self,
+        records: Sequence[EEGRecord],
+        *,
+        trial_sampling: TrialSamplingMode = "none",
+        trial_k_min: int = 1,
+        trial_k_max: int | None = None,
+    ) -> None:
         self.records = list(records)
+        self.trial_sampling = trial_sampling
+        self.trial_k_min = max(1, int(trial_k_min))
+        self.trial_k_max = None if trial_k_max is None else max(1, int(trial_k_max))
+
+    def _sample_trials(self, eeg: torch.Tensor) -> torch.Tensor:
+        if eeg.ndim != 3 or self.trial_sampling == "none":
+            return eeg
+        if self.trial_sampling != "random_avg":
+            raise ValueError(f"Unknown trial_sampling mode: {self.trial_sampling}")
+
+        num_trials = eeg.shape[0]
+        k_min = min(self.trial_k_min, num_trials)
+        k_max = num_trials if self.trial_k_max is None else min(self.trial_k_max, num_trials)
+        if k_max < k_min:
+            k_max = k_min
+
+        k = int(torch.randint(low=k_min, high=k_max + 1, size=(1,)).item())
+        trial_indices = torch.randperm(num_trials)[:k]
+        return eeg[trial_indices].mean(dim=0)
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str | int]:
         record = self.records[index]
+        eeg = self._sample_trials(record.eeg).contiguous()
         return {
-            "eeg": record.eeg,
+            "eeg": eeg,
             "image_id": record.image_id,
             "image_path": record.image_path,
             "label": record.label,
