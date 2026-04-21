@@ -68,8 +68,26 @@
 
 如果你只看这一节，应该能抓住整个项目到目前为止最重要的结论。
 
-1. **Retrieval 这条线已经基本跑通了，而且结果是可靠的。**
-   当前最好 checkpoint 是 [retrieval_dreamsim_only_atm_small_fixed/seed_0/best.pt](/home/xiaoh/DeepLearning/project1_eeg/outputs/experiments/retrieval_dreamsim_only_atm_small_fixed/seed_0/best.pt)，本地 200-way test 结果是：
+1. **Retrieval 这条线已经跑通，而且当前最强版本已经升级为“EEG backbone + DreamSim feature-space adapter”的协同训练主线。**
+   当前推荐 retrieval checkpoint family 是 `retrieval_adapter_atm_large_e40`，配置为：
+   - `DreamSim-only` perceptual bank，但在 feature space 上加入可训练 target adapter
+   - `ATM-large` encoder
+   - `visual17` 通道子集
+   - learnable EEG perturbation
+   - NeuroCLIP-lite loss，`soft_loss_coef=0.2`，`relation_loss_coef=0.0`
+   - perceptual target adapter，`beta=0.1`，`target_adapter_loss_weight=0.05`
+   - 训练 `40` epochs
+
+   本地 200-way test 的 3 个 seed 结果分别是：
+   - `seed0: top1 = 0.6300, top5 = 0.9400`
+   - `seed1: top1 = 0.6000, top5 = 0.9050`
+   - `seed2: top1 = 0.6400, top5 = 0.9400`
+
+   平均结果是：
+   - `top1 mean = 0.6233`
+   - `top5 mean = 0.9283`
+
+   作为对照，较早的 `retrieval_dreamsim_only_atm_small_fixed` 本地 200-way test 只有：
    - `top1 = 0.3450`
    - `top5 = 0.6250`
 
@@ -185,10 +203,23 @@
 2. 在 `clip + dreamsim` 的混合版本里，最后选出来的最佳 `alpha` 其实是 `0.0`，说明模型最终几乎完全依赖 DreamSim。
 3. 修正后的 DreamSim-only retrieval 是后面 reconstruction 的最好 backbone。
 
-最终，这条最好 retrieval 模型在本地 200-way test 上得到：
+最终，这条阶段性的 retrieval 模型在本地 200-way test 上得到：
 
 - `top1 = 0.3450`
 - `top5 = 0.6250`
+
+但在后续继续对 retrieval 主线做增强时，我们发现以下改动是有效的：
+
+- 把 encoder 从 `ATM-small` 升级为 `ATM-base`
+- 只保留 `DreamSim` perceptual bank，不再混用 CLIP
+- 加入 learnable EEG perturbation
+- 加入简化版 NeuroCLIP loss，但把 `relation loss` 权重降到 `0`
+- 只保留 `visual17` 通道子集
+
+在这组改动下，新的推荐 retrieval 主线 `retrieval_adapter_atm_large_e40` 在本地 200-way test 的 3 个 seed 平均达到：
+
+- `top1 mean = 0.6233`
+- `top5 mean = 0.9283`
 
 对应的关键文件是：
 

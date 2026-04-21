@@ -17,6 +17,29 @@ from project1_eeg.runtime import compute_retrieval_logits, compute_retrieval_out
 from project1_eeg.utils import DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR, resolve_device, save_json
 
 
+CHANNEL_PRESETS: dict[str, list[str]] = {
+    "visual17": [
+        "P7",
+        "P5",
+        "P3",
+        "P1",
+        "Pz",
+        "P2",
+        "P4",
+        "P6",
+        "P8",
+        "PO7",
+        "PO3",
+        "POz",
+        "PO4",
+        "PO8",
+        "O1",
+        "Oz",
+        "O2",
+    ]
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run retrieval inference on train/test splits.")
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -32,7 +55,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=["train", "test"], default="test")
     parser.add_argument("--split-file", type=Path, default=None)
     parser.add_argument("--image-id-source", choices=["all", "train_ids", "val_ids"], default="all")
+    parser.add_argument("--selected-channels", nargs="+", default=None)
+    parser.add_argument("--channel-preset", choices=sorted(CHANNEL_PRESETS.keys()), default=None)
     return parser.parse_args()
+
+
+def resolve_selected_channels(args: argparse.Namespace, config: dict) -> list[str] | None:
+    if args.selected_channels and args.channel_preset:
+        raise ValueError("--selected-channels and --channel-preset cannot both be set.")
+    if args.selected_channels:
+        return [str(channel) for channel in args.selected_channels]
+    if args.channel_preset:
+        return list(CHANNEL_PRESETS[args.channel_preset])
+    configured = config.get("selected_channels")
+    if configured is None:
+        return None
+    return [str(channel) for channel in configured]
 
 
 def resolve_bank(path: Path | None, fallback: str | None, *, name: str) -> TensorBank | None:
@@ -76,11 +114,13 @@ def main() -> None:
     if semantic_bank is None and perceptual_bank is None:
         raise ValueError("At least one of --semantic-bank or --perceptual-bank must resolve to a bank.")
 
+    selected_channels = resolve_selected_channels(args, config)
     selected_image_ids = load_split_image_ids(args.split_file, image_id_source=args.image_id_source)
     records = load_eeg_records(
         data_dir=args.data_dir,
         split=args.split,
         avg_trials=True,
+        selected_channels=selected_channels,
         image_ids=selected_image_ids,
     )
     loader = make_dataloader(

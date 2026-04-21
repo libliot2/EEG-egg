@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kandinsky-prior-model", type=str, default=DEFAULT_KANDINSKY_PRIOR_MODEL)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--num-workers", type=int, default=None)
     return parser.parse_args()
 
 
@@ -46,6 +47,7 @@ def main() -> None:
             model_name=args.clip_model,
             batch_size=args.batch_size,
             device=args.device,
+            num_workers=args.num_workers,
         )
     elif args.bank_type == "clip_text":
         bank = build_clip_text_bank(
@@ -62,6 +64,7 @@ def main() -> None:
             dreamsim_type=args.dreamsim_type,
             batch_size=args.batch_size,
             device=args.device,
+            num_workers=args.num_workers,
         )
     elif args.bank_type == "vae":
         bank = build_vae_latent_bank(
@@ -71,6 +74,7 @@ def main() -> None:
             batch_size=args.batch_size,
             image_size=args.image_size,
             device=args.device,
+            num_workers=args.num_workers,
         )
     else:
         bank = build_kandinsky_bank(

@@ -14,8 +14,38 @@ from torchvision import transforms
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = PROJECT_ROOT.parent
-DEFAULT_DATA_DIR = REPO_ROOT / "image-eeg-data"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
+
+
+def _first_existing_path(candidates: list[Path]) -> Path | None:
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_default_data_dir() -> Path:
+    candidates = [
+        PROJECT_ROOT / "image-eeg-data",
+        REPO_ROOT / "image-eeg-data",
+    ]
+    existing = _first_existing_path(candidates)
+    return existing or candidates[0]
+
+
+def _resolve_default_output_dir() -> Path:
+    primary = PROJECT_ROOT / "outputs"
+    fallback = PROJECT_ROOT / "outputs_local"
+
+    # Prefer the historical outputs path when it is usable. If the checked-in
+    # symlink points to a missing external mount, fall back to a local folder so
+    # the project remains runnable on a fresh machine.
+    if primary.exists():
+        return primary
+    return fallback
+
+
+DEFAULT_DATA_DIR = _resolve_default_data_dir()
+DEFAULT_OUTPUT_DIR = _resolve_default_output_dir()
 
 
 def ensure_dir(path: str | Path) -> Path:

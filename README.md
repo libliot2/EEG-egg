@@ -28,13 +28,15 @@ This repository is set up to exclude large local artifacts from version control:
 - downloaded model weights and checkpoints under `models/`
 - local environment directories, caches, and logs
 
-If you want to run the project, place the released dataset next to the repo in a
-directory named `image-eeg-data/`, so the default paths resolve as:
+If you want to run the project, place the released dataset in `image-eeg-data/`
+under the repo root. The current code also falls back to a sibling
+`../image-eeg-data/` layout for compatibility with older runs. The expected
+files are:
 
-- `../image-eeg-data/train.pt`
-- `../image-eeg-data/test.pt`
-- `../image-eeg-data/training_images/`
-- `../image-eeg-data/test_images/`
+- `image-eeg-data/train.pt`
+- `image-eeg-data/test.pt`
+- `image-eeg-data/training_images/`
+- `image-eeg-data/test_images/`
 
 ## Environment
 
@@ -76,7 +78,21 @@ Useful scripts:
 - `scripts/train_eeg_pretrain.py`
 - `scripts/log_experiment.py`
 
-Current historically strong runs discussed in the report:
+Current recommended retrieval baseline:
+
+- `retrieval_adapter_atm_large_e40`
+  - DreamSim perceptual bank plus a trainable feature-space target adapter
+  - `ATM-large` encoder
+  - `visual17` channel subset
+  - learnable EEG perturbation enabled
+  - NeuroCLIP-lite loss with `soft_loss_coef=0.2`, `relation_loss_coef=0.0`
+  - target adapter with `beta=0.1`, `target_adapter_loss_weight=0.05`
+  - trained for `40` epochs
+  - local 200-way test over three seeds:
+    - `top1 mean = 0.623`
+    - `top5 mean = 0.928`
+
+Older historically strong run:
 
 - retrieval backbone: `retrieval_dreamsim_only_atm_small_fixed`
 - reconstruction training checkpoint: `reconstruction_kandinsky_embed_v4_proxyselect`
@@ -114,6 +130,43 @@ python scripts/log_experiment.py finish \
 2. Train a retrieval model with `scripts/train_retrieval.py`.
 3. Train a reconstruction model with `scripts/train_reconstruction_embed.py`.
 4. Evaluate or decode predictions with the corresponding `predict_*.py` script.
+
+Recommended retrieval recipe:
+
+```bash
+python scripts/train_retrieval.py \
+  --data-dir image-eeg-data \
+  --perceptual-bank outputs_local/cache/dreamsim_train.pt \
+  --output-dir outputs_local/experiments/retrieval_adapter_atm_large_e40 \
+  --encoder-type atm_large \
+  --epochs 40 \
+  --batch-size 128 \
+  --num-workers 8 \
+  --device cuda \
+  --use-eeg-perturbation \
+  --retrieval-loss-type neuroclip \
+  --channel-preset visual17 \
+  --soft-loss-coef 0.2 \
+  --relation-loss-coef 0.0 \
+  --use-perceptual-target-adapter \
+  --target-adapter-hidden-dim 1024 \
+  --target-adapter-beta 0.1 \
+  --target-adapter-loss-weight 0.05
+```
+
+Evaluate the trained checkpoint:
+
+```bash
+python scripts/predict_retrieval.py \
+  --checkpoint outputs_local/experiments/retrieval_adapter_atm_large_e40/seed_0/best.pt \
+  --data-dir image-eeg-data \
+  --perceptual-bank outputs_local/cache/dreamsim_test.pt \
+  --output-dir outputs_local/experiments/retrieval_adapter_atm_large_e40/seed_0/test_eval \
+  --batch-size 128 \
+  --num-workers 8 \
+  --device cuda \
+  --evaluate
+```
 
 ## Notes
 

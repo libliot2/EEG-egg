@@ -8,6 +8,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class EEGPerturbation(nn.Module):
+    def __init__(self, in_channels: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1, in_channels, 1))
+        self.bias = nn.Parameter(torch.zeros(1, in_channels, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.weight + self.bias
+
+
+class TargetFeatureAdapter(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        hidden_dim: int,
+        dropout: float = 0.1,
+        beta: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.beta = float(beta)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        delta = self.net(x)
+        adapted = (1.0 - self.beta) * x + self.beta * (x + delta)
+        return F.normalize(adapted, dim=-1)
+
+
 class ResidualTemporalBlock(nn.Module):
     def __init__(self, channels: int, kernel_size: int = 5, dilation: int = 1) -> None:
         super().__init__()
@@ -34,10 +68,12 @@ class EEGEncoder(nn.Module):
         embedding_dim: int = 768,
         channel_dropout: float = 0.1,
         time_mask_ratio: float = 0.1,
+        use_eeg_perturbation: bool = False,
     ) -> None:
         super().__init__()
         self.channel_dropout = channel_dropout
         self.time_mask_ratio = time_mask_ratio
+        self.eeg_perturbation = EEGPerturbation(in_channels) if use_eeg_perturbation else nn.Identity()
         self.stem = nn.Sequential(
             nn.Conv1d(in_channels, hidden_dim, kernel_size=7, padding=3, bias=False),
             nn.BatchNorm1d(hidden_dim),
@@ -71,6 +107,7 @@ class EEGEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._augment(x)
+        x = self.eeg_perturbation(x)
         features = self.blocks(self.stem(x))
         attn = torch.softmax(self.attention(features), dim=-1)
         pooled = torch.sum(features * attn, dim=-1)
@@ -92,6 +129,7 @@ class ATMEncoder(nn.Module):
         transformer_layers: int = 2,
         transformer_heads: int = 8,
         dropout: float = 0.1,
+        use_eeg_perturbation: bool = False,
     ) -> None:
         super().__init__()
         if variant not in {"small", "base", "large"}:
@@ -100,6 +138,7 @@ class ATMEncoder(nn.Module):
         self.time_mask_ratio = time_mask_ratio
         self.output_dim = embedding_dim
         self.variant = variant
+        self.eeg_perturbation = EEGPerturbation(in_channels) if use_eeg_perturbation else nn.Identity()
 
         temporal_dilations = {
             "small": (1, 2, 4),
@@ -165,6 +204,7 @@ class ATMEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._augment(x)
+        x = self.eeg_perturbation(x)
 
         temporal = self.temporal_blocks(self.temporal_stem(x))
         temporal_attn = torch.softmax(self.temporal_attention(temporal), dim=-1)
@@ -251,12 +291,19 @@ class RetrievalModel(nn.Module):
         transformer_layers: int = 2,
         transformer_heads: int = 8,
         dropout: float = 0.1,
+        use_eeg_perturbation: bool = False,
+        use_semantic_target_adapter: bool = False,
+        use_perceptual_target_adapter: bool = False,
+        target_adapter_hidden_dim: int = 1024,
+        target_adapter_dropout: float = 0.1,
+        target_adapter_beta: float = 0.1,
     ) -> None:
         super().__init__()
         self.encoder_type = encoder_type
         self.embedding_dim = embedding_dim
         self.semantic_dim = semantic_dim
         self.perceptual_dim = perceptual_dim
+        self.target_adapter_beta = float(target_adapter_beta)
         self.legacy_mode = (
             encoder_type == "legacy_cnn"
             and perceptual_dim is None
@@ -270,6 +317,7 @@ class RetrievalModel(nn.Module):
                 embedding_dim=embedding_dim,
                 channel_dropout=channel_dropout,
                 time_mask_ratio=time_mask_ratio,
+                use_eeg_perturbation=use_eeg_perturbation,
             )
             self.logit_scale = nn.Parameter(torch.tensor(2.6593))
             return
@@ -296,13 +344,28 @@ class RetrievalModel(nn.Module):
             transformer_layers=transformer_layers,
             transformer_heads=transformer_heads,
             dropout=dropout,
+            use_eeg_perturbation=use_eeg_perturbation,
         )
         if semantic_dim is not None:
             self.semantic_head = ProjectionHead(embedding_dim, semantic_dim, dropout=dropout)
             self.semantic_logit_scale = nn.Parameter(torch.tensor(2.6593))
+            if use_semantic_target_adapter:
+                self.semantic_target_adapter = TargetFeatureAdapter(
+                    semantic_dim,
+                    hidden_dim=target_adapter_hidden_dim,
+                    dropout=target_adapter_dropout,
+                    beta=target_adapter_beta,
+                )
         if perceptual_dim is not None:
             self.perceptual_head = ProjectionHead(embedding_dim, perceptual_dim, dropout=dropout)
             self.perceptual_logit_scale = nn.Parameter(torch.tensor(2.6593))
+            if use_perceptual_target_adapter:
+                self.perceptual_target_adapter = TargetFeatureAdapter(
+                    perceptual_dim,
+                    hidden_dim=target_adapter_hidden_dim,
+                    dropout=target_adapter_dropout,
+                    beta=target_adapter_beta,
+                )
 
     def has_head(self, head: str) -> bool:
         if head == "legacy":
@@ -355,11 +418,42 @@ class RetrievalModel(nn.Module):
         head: str | None = None,
     ) -> torch.Tensor:
         head = head or self.primary_head()
+        image_embeddings = self.adapt_target_embeddings(image_embeddings, head=head)
         if head == "legacy":
             scale = self.logit_scale.exp().clamp(max=100.0)
         else:
             scale = getattr(self, f"{head}_logit_scale").exp().clamp(max=100.0)
         return scale * eeg_embeddings @ image_embeddings.T
+
+    def adapt_target_embeddings(
+        self,
+        image_embeddings: torch.Tensor,
+        *,
+        head: str | None = None,
+    ) -> torch.Tensor:
+        head = head or self.primary_head()
+        if head == "legacy":
+            return image_embeddings
+        adapter = getattr(self, f"{head}_target_adapter", None)
+        if adapter is None:
+            return image_embeddings
+        return adapter(image_embeddings)
+
+    def target_adapter_regularization(
+        self,
+        image_embeddings: torch.Tensor,
+        *,
+        head: str | None = None,
+    ) -> torch.Tensor | None:
+        head = head or self.primary_head()
+        if head == "legacy":
+            return None
+        adapter = getattr(self, f"{head}_target_adapter", None)
+        if adapter is None:
+            return None
+        adapted = adapter(image_embeddings)
+        baseline = F.normalize(image_embeddings, dim=-1)
+        return F.mse_loss(adapted, baseline)
 
 
 def retrieval_loss(
@@ -374,6 +468,80 @@ def retrieval_loss(
     return (F.cross_entropy(logits, targets) + F.cross_entropy(logits.T, targets)) * 0.5
 
 
+def soft_clip_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    log_probs = F.log_softmax(logits, dim=-1)
+    return -(targets * log_probs).sum(dim=-1).mean()
+
+
+def build_soft_targets(
+    eeg_embeddings: torch.Tensor,
+    image_embeddings: torch.Tensor,
+    *,
+    beta: float,
+) -> torch.Tensor:
+    eeg_similarity = F.normalize(eeg_embeddings, dim=-1) @ F.normalize(eeg_embeddings, dim=-1).T
+    image_similarity = F.normalize(image_embeddings, dim=-1) @ F.normalize(image_embeddings, dim=-1).T
+    blended_similarity = 0.5 * (eeg_similarity + image_similarity)
+    return torch.softmax(blended_similarity * beta, dim=-1)
+
+
+def off_diagonal_log_probs(logits: torch.Tensor) -> torch.Tensor:
+    mask = ~torch.eye(logits.shape[0], device=logits.device, dtype=torch.bool)
+    masked = logits.masked_fill(~mask, float("-inf"))
+    log_probs = F.log_softmax(masked, dim=-1)
+    return log_probs.masked_fill(~mask, 0.0)
+
+
+def relation_alignment_loss(
+    logits: torch.Tensor,
+    eeg_embeddings: torch.Tensor,
+    image_embeddings: torch.Tensor,
+    *,
+    beta: float,
+) -> torch.Tensor:
+    targets = build_soft_targets(eeg_embeddings, image_embeddings, beta=beta)
+    mask = ~torch.eye(targets.shape[0], device=targets.device, dtype=torch.bool)
+    masked_targets = targets.masked_fill(~mask, 0.0)
+    masked_targets = masked_targets / masked_targets.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    return -(masked_targets * off_diagonal_log_probs(logits)).sum(dim=-1).mean()
+
+
+def neuroclip_retrieval_loss(
+    model: RetrievalModel,
+    eeg_embeddings: torch.Tensor,
+    image_embeddings: torch.Tensor,
+    *,
+    head: str | None = None,
+    soft_target_beta: float = 10.0,
+    clip_loss_coef: float = 1.0,
+    soft_loss_coef: float = 0.3,
+    relation_loss_coef: float = 0.05,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    logits = model.similarity(eeg_embeddings, image_embeddings, head=head)
+    targets = torch.arange(logits.shape[0], device=logits.device)
+    clip_loss = (F.cross_entropy(logits, targets) + F.cross_entropy(logits.T, targets)) * 0.5
+
+    soft_targets = build_soft_targets(eeg_embeddings, image_embeddings, beta=soft_target_beta)
+    soft_loss = (soft_clip_loss(logits, soft_targets) + soft_clip_loss(logits.T, soft_targets.T)) * 0.5
+
+    relation_loss = (
+        relation_alignment_loss(logits, eeg_embeddings, image_embeddings, beta=soft_target_beta)
+        + relation_alignment_loss(logits.T, image_embeddings, eeg_embeddings, beta=soft_target_beta)
+    ) * 0.5
+
+    total = clip_loss * clip_loss_coef
+    total = total + soft_loss * soft_loss_coef
+    total = total + relation_loss * relation_loss_coef
+    return total, {
+        "clip_loss": float(clip_loss.item()),
+        "soft_loss": float(soft_loss.item()),
+        "relation_loss": float(relation_loss.item()),
+    }
+
+
 def weighted_retrieval_loss(
     model: RetrievalModel,
     outputs: RetrievalOutputs,
@@ -382,29 +550,71 @@ def weighted_retrieval_loss(
     perceptual_targets: torch.Tensor | None = None,
     semantic_weight: float = 1.0,
     perceptual_weight: float = 0.7,
+    retrieval_loss_type: str = "clip",
+    soft_target_beta: float = 10.0,
+    clip_loss_coef: float = 1.0,
+    soft_loss_coef: float = 0.3,
+    relation_loss_coef: float = 0.05,
+    target_adapter_loss_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total_loss: torch.Tensor | None = None
     metrics: dict[str, float] = {}
 
+    def compute_loss(
+        eeg_embeddings: torch.Tensor,
+        image_embeddings: torch.Tensor,
+        *,
+        head: str,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        if retrieval_loss_type == "clip":
+            loss = retrieval_loss(model, eeg_embeddings, image_embeddings, head=head)
+            return loss, {}
+        if retrieval_loss_type == "neuroclip":
+            return neuroclip_retrieval_loss(
+                model,
+                eeg_embeddings,
+                image_embeddings,
+                head=head,
+                soft_target_beta=soft_target_beta,
+                clip_loss_coef=clip_loss_coef,
+                soft_loss_coef=soft_loss_coef,
+                relation_loss_coef=relation_loss_coef,
+            )
+        raise ValueError(f"Unknown retrieval_loss_type: {retrieval_loss_type}")
+
     if outputs.legacy is not None:
         if semantic_targets is None:
             raise ValueError("semantic_targets are required for legacy retrieval.")
-        loss = retrieval_loss(model, outputs.legacy, semantic_targets, head="legacy")
+        loss, extra_metrics = compute_loss(outputs.legacy, semantic_targets, head="legacy")
         total_loss = loss
         metrics["legacy_loss"] = float(loss.item())
+        for key, value in extra_metrics.items():
+            metrics[f"legacy_{key}"] = value
     else:
         if outputs.semantic is not None and semantic_targets is not None and semantic_weight > 0.0:
-            semantic_loss = retrieval_loss(model, outputs.semantic, semantic_targets, head="semantic")
+            semantic_loss, extra_metrics = compute_loss(outputs.semantic, semantic_targets, head="semantic")
             total_loss = semantic_loss * semantic_weight if total_loss is None else total_loss + semantic_loss * semantic_weight
             metrics["semantic_loss"] = float(semantic_loss.item())
+            for key, value in extra_metrics.items():
+                metrics[f"semantic_{key}"] = value
+            semantic_adapter_reg = model.target_adapter_regularization(semantic_targets, head="semantic")
+            if semantic_adapter_reg is not None and target_adapter_loss_weight > 0.0:
+                total_loss = total_loss + semantic_adapter_reg * target_adapter_loss_weight
+                metrics["semantic_target_adapter_reg"] = float(semantic_adapter_reg.item())
         if outputs.perceptual is not None and perceptual_targets is not None and perceptual_weight > 0.0:
-            perceptual_loss = retrieval_loss(model, outputs.perceptual, perceptual_targets, head="perceptual")
+            perceptual_loss, extra_metrics = compute_loss(outputs.perceptual, perceptual_targets, head="perceptual")
             total_loss = (
                 perceptual_loss * perceptual_weight
                 if total_loss is None
                 else total_loss + perceptual_loss * perceptual_weight
             )
             metrics["perceptual_loss"] = float(perceptual_loss.item())
+            for key, value in extra_metrics.items():
+                metrics[f"perceptual_{key}"] = value
+            perceptual_adapter_reg = model.target_adapter_regularization(perceptual_targets, head="perceptual")
+            if perceptual_adapter_reg is not None and target_adapter_loss_weight > 0.0:
+                total_loss = total_loss + perceptual_adapter_reg * target_adapter_loss_weight
+                metrics["perceptual_target_adapter_reg"] = float(perceptual_adapter_reg.item())
 
     if total_loss is None:
         raise ValueError("No retrieval loss terms were enabled.")
@@ -426,4 +636,10 @@ def build_retrieval_model_from_config(config: dict) -> RetrievalModel:
         transformer_layers=int(config.get("transformer_layers", 2)),
         transformer_heads=int(config.get("transformer_heads", 8)),
         dropout=float(config.get("dropout", 0.1)),
+        use_eeg_perturbation=bool(config.get("use_eeg_perturbation", False)),
+        use_semantic_target_adapter=bool(config.get("use_semantic_target_adapter", False)),
+        use_perceptual_target_adapter=bool(config.get("use_perceptual_target_adapter", False)),
+        target_adapter_hidden_dim=int(config.get("target_adapter_hidden_dim", 1024)),
+        target_adapter_dropout=float(config.get("target_adapter_dropout", 0.1)),
+        target_adapter_beta=float(config.get("target_adapter_beta", 0.1)),
     )

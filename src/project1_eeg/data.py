@@ -119,7 +119,12 @@ def load_eeg_records(
 
     if selected_channels is not None:
         channel_indices = _selected_channel_indices_from_jsonl(selected_channels, eeg_channel_jsonl)
-        eeg = eeg[:, channel_indices, :]
+        if eeg.ndim == 3:
+            eeg = eeg[:, channel_indices, :]
+        elif eeg.ndim == 4:
+            eeg = eeg[:, :, channel_indices, :]
+        else:
+            raise ValueError(f"Unexpected EEG tensor shape while selecting channels: {tuple(eeg.shape)}")
 
     if texts is None:
         texts = [""] * len(images)
