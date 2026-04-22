@@ -235,6 +235,325 @@ class ATMLargeEncoder(ATMEncoder):
         super().__init__(variant="large", **kwargs)
 
 
+class ATMSpatialEncoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_channels: int = 63,
+        hidden_dim: int = 256,
+        embedding_dim: int = 768,
+        channel_dropout: float = 0.1,
+        time_mask_ratio: float = 0.1,
+        transformer_layers: int = 2,
+        transformer_heads: int = 8,
+        dropout: float = 0.1,
+        use_eeg_perturbation: bool = False,
+    ) -> None:
+        super().__init__()
+        self.channel_dropout = channel_dropout
+        self.time_mask_ratio = time_mask_ratio
+        self.output_dim = embedding_dim
+        self.eeg_perturbation = EEGPerturbation(in_channels) if use_eeg_perturbation else nn.Identity()
+        frequency_hidden_dim = max(hidden_dim // 2, 64)
+        channel_token_dim = max(hidden_dim // 2, 128)
+
+        self.temporal_stem = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+        )
+        self.temporal_blocks = nn.Sequential(
+            ResidualTemporalBlock(hidden_dim, dilation=1),
+            ResidualTemporalBlock(hidden_dim, dilation=2),
+            ResidualTemporalBlock(hidden_dim, dilation=4),
+            ResidualTemporalBlock(hidden_dim, dilation=8),
+            ResidualTemporalBlock(hidden_dim, dilation=16),
+        )
+        self.temporal_attention = nn.Conv1d(hidden_dim, 1, kernel_size=1)
+
+        temporal_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=transformer_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(temporal_encoder_layer, num_layers=transformer_layers)
+        self.transformer_norm = nn.LayerNorm(hidden_dim)
+
+        self.channel_tokenizer = nn.Sequential(
+            nn.Conv1d(
+                in_channels,
+                in_channels * channel_token_dim,
+                kernel_size=7,
+                padding=3,
+                groups=in_channels,
+                bias=False,
+            ),
+            nn.BatchNorm1d(in_channels * channel_token_dim),
+            nn.GELU(),
+        )
+        self.channel_positional = nn.Parameter(torch.zeros(1, in_channels, channel_token_dim))
+        channel_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=channel_token_dim,
+            nhead=max(1, min(transformer_heads, channel_token_dim // 32)),
+            dim_feedforward=channel_token_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.channel_transformer = nn.TransformerEncoder(channel_encoder_layer, num_layers=max(1, transformer_layers))
+        self.channel_norm = nn.LayerNorm(channel_token_dim)
+        self.channel_attention = nn.Linear(channel_token_dim, 1)
+
+        self.frequency_branch = nn.Sequential(
+            nn.Conv1d(in_channels, frequency_hidden_dim, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(frequency_hidden_dim),
+            nn.GELU(),
+            ResidualTemporalBlock(frequency_hidden_dim, dilation=1),
+            ResidualTemporalBlock(frequency_hidden_dim, dilation=2),
+            ResidualTemporalBlock(frequency_hidden_dim, dilation=4),
+            ResidualTemporalBlock(frequency_hidden_dim, dilation=8),
+        )
+
+        fusion_dim = hidden_dim * 2 + frequency_hidden_dim + channel_token_dim
+        self.projection = nn.Sequential(
+            nn.Linear(fusion_dim, hidden_dim * 3),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim * 3, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+        )
+
+    def _augment(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training and self.channel_dropout > 0.0:
+            mask = torch.rand(x.shape[:2], device=x.device) > self.channel_dropout
+            x = x * mask.unsqueeze(-1)
+        if self.training and self.time_mask_ratio > 0.0:
+            time_steps = x.shape[-1]
+            mask_width = max(1, int(time_steps * self.time_mask_ratio))
+            starts = torch.randint(0, max(1, time_steps - mask_width + 1), (x.shape[0],), device=x.device)
+            for batch_idx, start in enumerate(starts.tolist()):
+                x[batch_idx, :, start : start + mask_width] = 0.0
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._augment(x)
+        x = self.eeg_perturbation(x)
+
+        temporal = self.temporal_blocks(self.temporal_stem(x))
+        temporal_attn = torch.softmax(self.temporal_attention(temporal), dim=-1)
+        temporal_pooled = torch.sum(temporal * temporal_attn, dim=-1)
+
+        temporal_tokens = F.avg_pool1d(temporal, kernel_size=4, stride=4).transpose(1, 2)
+        transformed = self.transformer_norm(self.transformer(temporal_tokens)).mean(dim=1)
+
+        channel_features = self.channel_tokenizer(x)
+        channel_features = channel_features.view(x.shape[0], x.shape[1], -1, x.shape[-1]).mean(dim=-1)
+        channel_tokens = self.channel_norm(self.channel_transformer(channel_features + self.channel_positional))
+        channel_attn = torch.softmax(self.channel_attention(channel_tokens), dim=1)
+        channel_pooled = torch.sum(channel_tokens * channel_attn, dim=1)
+
+        spectrum = torch.log1p(torch.fft.rfft(x, dim=-1).abs())
+        frequency = self.frequency_branch(spectrum).mean(dim=-1)
+
+        fused = torch.cat([temporal_pooled, transformed, frequency, channel_pooled], dim=-1)
+        return self.projection(fused)
+
+
+class ATMMultiScaleEncoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_channels: int = 63,
+        hidden_dim: int = 256,
+        embedding_dim: int = 768,
+        channel_dropout: float = 0.1,
+        time_mask_ratio: float = 0.1,
+        transformer_layers: int = 2,
+        transformer_heads: int = 8,
+        dropout: float = 0.1,
+        use_eeg_perturbation: bool = False,
+    ) -> None:
+        super().__init__()
+        self.channel_dropout = channel_dropout
+        self.time_mask_ratio = time_mask_ratio
+        self.output_dim = embedding_dim
+        self.eeg_perturbation = EEGPerturbation(in_channels) if use_eeg_perturbation else nn.Identity()
+        self.multiscale_pooling = (2, 4, 8)
+        frequency_hidden_dim = max(hidden_dim // 2, 64)
+
+        self.temporal_stem = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+        )
+        self.temporal_blocks = nn.Sequential(
+            ResidualTemporalBlock(hidden_dim, dilation=1),
+            ResidualTemporalBlock(hidden_dim, dilation=2),
+            ResidualTemporalBlock(hidden_dim, dilation=4),
+            ResidualTemporalBlock(hidden_dim, dilation=8),
+            ResidualTemporalBlock(hidden_dim, dilation=16),
+            ResidualTemporalBlock(hidden_dim, dilation=32),
+        )
+        self.temporal_attention = nn.Conv1d(hidden_dim, 1, kernel_size=1)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=transformer_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=transformer_layers)
+        self.transformer_norm = nn.LayerNorm(hidden_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.scale_embeddings = nn.Parameter(torch.zeros(len(self.multiscale_pooling), 1, hidden_dim))
+        self.token_attention = nn.Linear(hidden_dim, 1)
+
+        self.frequency_branch = nn.Sequential(
+            nn.Conv1d(in_channels, frequency_hidden_dim, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(frequency_hidden_dim),
+            nn.GELU(),
+            ResidualTemporalBlock(frequency_hidden_dim, dilation=1),
+            ResidualTemporalBlock(frequency_hidden_dim, dilation=2),
+            ResidualTemporalBlock(frequency_hidden_dim, dilation=4),
+            ResidualTemporalBlock(frequency_hidden_dim, dilation=8),
+        )
+
+        fusion_dim = hidden_dim * 4 + frequency_hidden_dim
+        self.projection = nn.Sequential(
+            nn.Linear(fusion_dim, hidden_dim * 3),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim * 3, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+        )
+
+    def _augment(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training and self.channel_dropout > 0.0:
+            mask = torch.rand(x.shape[:2], device=x.device) > self.channel_dropout
+            x = x * mask.unsqueeze(-1)
+        if self.training and self.time_mask_ratio > 0.0:
+            time_steps = x.shape[-1]
+            mask_width = max(1, int(time_steps * self.time_mask_ratio))
+            starts = torch.randint(0, max(1, time_steps - mask_width + 1), (x.shape[0],), device=x.device)
+            for batch_idx, start in enumerate(starts.tolist()):
+                x[batch_idx, :, start : start + mask_width] = 0.0
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._augment(x)
+        x = self.eeg_perturbation(x)
+
+        temporal = self.temporal_blocks(self.temporal_stem(x))
+        temporal_attn = torch.softmax(self.temporal_attention(temporal), dim=-1)
+        temporal_pooled = torch.sum(temporal * temporal_attn, dim=-1)
+        temporal_mean = temporal.mean(dim=-1)
+
+        multiscale_tokens: list[torch.Tensor] = []
+        for idx, pooling_stride in enumerate(self.multiscale_pooling):
+            tokens = F.avg_pool1d(temporal, kernel_size=pooling_stride, stride=pooling_stride).transpose(1, 2)
+            multiscale_tokens.append(tokens + self.scale_embeddings[idx])
+        token_sequence = torch.cat(multiscale_tokens, dim=1)
+        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+        transformed = self.transformer_norm(self.transformer(torch.cat([cls_token, token_sequence], dim=1)))
+        cls_repr = transformed[:, 0]
+        sequence_repr = transformed[:, 1:]
+        sequence_attn = torch.softmax(self.token_attention(sequence_repr), dim=1)
+        token_pooled = torch.sum(sequence_repr * sequence_attn, dim=1)
+
+        spectrum = torch.log1p(torch.fft.rfft(x, dim=-1).abs())
+        frequency = self.frequency_branch(spectrum).mean(dim=-1)
+
+        fused = torch.cat([temporal_pooled, temporal_mean, cls_repr, token_pooled, frequency], dim=-1)
+        return self.projection(fused)
+
+
+class EEGConformerEncoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_channels: int = 63,
+        hidden_dim: int = 256,
+        embedding_dim: int = 768,
+        channel_dropout: float = 0.1,
+        time_mask_ratio: float = 0.1,
+        transformer_layers: int = 2,
+        transformer_heads: int = 8,
+        dropout: float = 0.1,
+        use_eeg_perturbation: bool = False,
+    ) -> None:
+        super().__init__()
+        self.channel_dropout = channel_dropout
+        self.time_mask_ratio = time_mask_ratio
+        self.output_dim = embedding_dim
+        self.eeg_perturbation = EEGPerturbation(in_channels) if use_eeg_perturbation else nn.Identity()
+        patch_dim = hidden_dim
+
+        self.patch_embedding = nn.Sequential(
+            nn.Conv2d(1, patch_dim // 2, kernel_size=(1, 25), padding=(0, 12), bias=False),
+            nn.BatchNorm2d(patch_dim // 2),
+            nn.GELU(),
+            nn.Conv2d(patch_dim // 2, patch_dim, kernel_size=(in_channels, 1), bias=False),
+            nn.BatchNorm2d(patch_dim),
+            nn.GELU(),
+            nn.AvgPool2d(kernel_size=(1, 4), stride=(1, 4)),
+            nn.Dropout(p=dropout),
+        )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, patch_dim))
+        self.token_dropout = nn.Dropout(p=dropout)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=patch_dim,
+            nhead=transformer_heads,
+            dim_feedforward=patch_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=transformer_layers)
+        self.transformer_norm = nn.LayerNorm(patch_dim)
+        self.token_attention = nn.Linear(patch_dim, 1)
+        self.projection = nn.Sequential(
+            nn.Linear(patch_dim * 2, patch_dim * 2),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(patch_dim * 2, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+        )
+
+    def _augment(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training and self.channel_dropout > 0.0:
+            mask = torch.rand(x.shape[:2], device=x.device) > self.channel_dropout
+            x = x * mask.unsqueeze(-1)
+        if self.training and self.time_mask_ratio > 0.0:
+            time_steps = x.shape[-1]
+            mask_width = max(1, int(time_steps * self.time_mask_ratio))
+            starts = torch.randint(0, max(1, time_steps - mask_width + 1), (x.shape[0],), device=x.device)
+            for batch_idx, start in enumerate(starts.tolist()):
+                x[batch_idx, :, start : start + mask_width] = 0.0
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._augment(x)
+        x = self.eeg_perturbation(x)
+
+        patches = self.patch_embedding(x.unsqueeze(1)).squeeze(2).transpose(1, 2)
+        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+        encoded = self.transformer_norm(self.transformer(self.token_dropout(torch.cat([cls_token, patches], dim=1))))
+        cls_repr = encoded[:, 0]
+        patch_tokens = encoded[:, 1:]
+        patch_attn = torch.softmax(self.token_attention(patch_tokens), dim=1)
+        patch_pooled = torch.sum(patch_tokens * patch_attn, dim=1)
+        return self.projection(torch.cat([cls_repr, patch_pooled], dim=-1))
+
+
 class ProjectionHead(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1) -> None:
         super().__init__()
@@ -331,6 +650,9 @@ class RetrievalModel(nn.Module):
             "atm_small": ATMSmallEncoder,
             "atm_base": ATMBaseEncoder,
             "atm_large": ATMLargeEncoder,
+            "atm_spatial": ATMSpatialEncoder,
+            "atm_multiscale": ATMMultiScaleEncoder,
+            "eeg_conformer": EEGConformerEncoder,
         }.get(encoder_type)
         if encoder_cls is None:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
@@ -463,9 +785,8 @@ def retrieval_loss(
     *,
     head: str | None = None,
 ) -> torch.Tensor:
-    logits = model.similarity(eeg_embeddings, image_embeddings, head=head)
-    targets = torch.arange(logits.shape[0], device=logits.device)
-    return (F.cross_entropy(logits, targets) + F.cross_entropy(logits.T, targets)) * 0.5
+    loss, _ = clip_retrieval_loss(model, eeg_embeddings, image_embeddings, head=head)
+    return loss
 
 
 def soft_clip_loss(
@@ -481,11 +802,119 @@ def build_soft_targets(
     image_embeddings: torch.Tensor,
     *,
     beta: float,
+    source: str = "blend",
 ) -> torch.Tensor:
     eeg_similarity = F.normalize(eeg_embeddings, dim=-1) @ F.normalize(eeg_embeddings, dim=-1).T
     image_similarity = F.normalize(image_embeddings, dim=-1) @ F.normalize(image_embeddings, dim=-1).T
-    blended_similarity = 0.5 * (eeg_similarity + image_similarity)
-    return torch.softmax(blended_similarity * beta, dim=-1)
+    if source == "eeg":
+        target_similarity = eeg_similarity
+    elif source == "image":
+        target_similarity = image_similarity
+    elif source == "blend":
+        target_similarity = 0.5 * (eeg_similarity + image_similarity)
+    else:
+        raise ValueError(f"Unknown soft target source: {source}")
+    return torch.softmax(target_similarity * beta, dim=-1)
+
+
+def combine_directional_losses(
+    forward_loss: torch.Tensor,
+    backward_loss: torch.Tensor,
+    *,
+    eeg_to_image_weight: float = 1.0,
+    image_to_eeg_weight: float = 1.0,
+) -> torch.Tensor:
+    total_weight = float(eeg_to_image_weight) + float(image_to_eeg_weight)
+    if total_weight <= 0.0:
+        raise ValueError("At least one directional loss weight must be positive.")
+    return (
+        forward_loss * float(eeg_to_image_weight) + backward_loss * float(image_to_eeg_weight)
+    ) / total_weight
+
+
+def cosine_similarity_matrix(
+    model: RetrievalModel,
+    eeg_embeddings: torch.Tensor,
+    image_embeddings: torch.Tensor,
+    *,
+    head: str | None = None,
+) -> torch.Tensor:
+    head = head or model.primary_head()
+    adapted_targets = model.adapt_target_embeddings(image_embeddings, head=head)
+    return F.normalize(eeg_embeddings, dim=-1) @ F.normalize(adapted_targets, dim=-1).T
+
+
+def hard_negative_margin_loss(
+    scores: torch.Tensor,
+    *,
+    margin: float = 0.1,
+    topk: int = 1,
+) -> torch.Tensor:
+    if scores.ndim != 2 or scores.shape[0] != scores.shape[1]:
+        raise ValueError("hard_negative_margin_loss expects a square pairwise similarity matrix.")
+    if scores.shape[0] <= 1 or topk <= 0:
+        return scores.new_zeros(())
+
+    diagonal = scores.diagonal()
+    mask = torch.eye(scores.shape[0], device=scores.device, dtype=torch.bool)
+    negative_scores = scores.masked_fill(mask, float("-inf"))
+    resolved_topk = min(int(topk), max(1, scores.shape[1] - 1))
+    hardest_negatives = negative_scores.topk(k=resolved_topk, dim=-1).values.mean(dim=-1)
+    return F.relu(float(margin) + hardest_negatives - diagonal).mean()
+
+
+def clip_retrieval_loss(
+    model: RetrievalModel,
+    eeg_embeddings: torch.Tensor,
+    image_embeddings: torch.Tensor,
+    *,
+    head: str | None = None,
+    eeg_to_image_weight: float = 1.0,
+    image_to_eeg_weight: float = 1.0,
+    hard_negative_loss_coef: float = 0.0,
+    hard_negative_topk: int = 0,
+    hard_negative_margin: float = 0.1,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    logits = model.similarity(eeg_embeddings, image_embeddings, head=head)
+    targets = torch.arange(logits.shape[0], device=logits.device)
+    clip_forward = F.cross_entropy(logits, targets)
+    clip_backward = F.cross_entropy(logits.T, targets)
+    clip_loss = combine_directional_losses(
+        clip_forward,
+        clip_backward,
+        eeg_to_image_weight=eeg_to_image_weight,
+        image_to_eeg_weight=image_to_eeg_weight,
+    )
+
+    total = clip_loss
+    metrics = {
+        "clip_loss": float(clip_loss.item()),
+        "clip_forward_loss": float(clip_forward.item()),
+        "clip_backward_loss": float(clip_backward.item()),
+    }
+    if hard_negative_loss_coef > 0.0 and hard_negative_topk > 0:
+        scores = cosine_similarity_matrix(model, eeg_embeddings, image_embeddings, head=head)
+        hard_negative_forward = hard_negative_margin_loss(
+            scores,
+            margin=hard_negative_margin,
+            topk=hard_negative_topk,
+        )
+        hard_negative_backward = hard_negative_margin_loss(
+            scores.T,
+            margin=hard_negative_margin,
+            topk=hard_negative_topk,
+        )
+        hard_negative_loss = combine_directional_losses(
+            hard_negative_forward,
+            hard_negative_backward,
+            eeg_to_image_weight=eeg_to_image_weight,
+            image_to_eeg_weight=image_to_eeg_weight,
+        )
+        total = total + hard_negative_loss * float(hard_negative_loss_coef)
+        metrics["hard_negative_loss"] = float(hard_negative_loss.item())
+        metrics["hard_negative_forward_loss"] = float(hard_negative_forward.item())
+        metrics["hard_negative_backward_loss"] = float(hard_negative_backward.item())
+    return total, metrics
 
 
 def off_diagonal_log_probs(logits: torch.Tensor) -> torch.Tensor:
@@ -501,8 +930,9 @@ def relation_alignment_loss(
     image_embeddings: torch.Tensor,
     *,
     beta: float,
+    soft_target_source: str = "blend",
 ) -> torch.Tensor:
-    targets = build_soft_targets(eeg_embeddings, image_embeddings, beta=beta)
+    targets = build_soft_targets(eeg_embeddings, image_embeddings, beta=beta, source=soft_target_source)
     mask = ~torch.eye(targets.shape[0], device=targets.device, dtype=torch.bool)
     masked_targets = targets.masked_fill(~mask, 0.0)
     masked_targets = masked_targets / masked_targets.sum(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -516,29 +946,103 @@ def neuroclip_retrieval_loss(
     *,
     head: str | None = None,
     soft_target_beta: float = 10.0,
+    soft_target_source: str = "blend",
     clip_loss_coef: float = 1.0,
     soft_loss_coef: float = 0.3,
     relation_loss_coef: float = 0.05,
+    eeg_to_image_weight: float = 1.0,
+    image_to_eeg_weight: float = 1.0,
+    hard_negative_loss_coef: float = 0.0,
+    hard_negative_topk: int = 0,
+    hard_negative_margin: float = 0.1,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     logits = model.similarity(eeg_embeddings, image_embeddings, head=head)
     targets = torch.arange(logits.shape[0], device=logits.device)
-    clip_loss = (F.cross_entropy(logits, targets) + F.cross_entropy(logits.T, targets)) * 0.5
+    clip_forward = F.cross_entropy(logits, targets)
+    clip_backward = F.cross_entropy(logits.T, targets)
+    clip_loss = combine_directional_losses(
+        clip_forward,
+        clip_backward,
+        eeg_to_image_weight=eeg_to_image_weight,
+        image_to_eeg_weight=image_to_eeg_weight,
+    )
 
-    soft_targets = build_soft_targets(eeg_embeddings, image_embeddings, beta=soft_target_beta)
-    soft_loss = (soft_clip_loss(logits, soft_targets) + soft_clip_loss(logits.T, soft_targets.T)) * 0.5
+    soft_targets = build_soft_targets(
+        eeg_embeddings,
+        image_embeddings,
+        beta=soft_target_beta,
+        source=soft_target_source,
+    )
+    soft_forward = soft_clip_loss(logits, soft_targets)
+    soft_backward = soft_clip_loss(logits.T, soft_targets.T)
+    soft_loss = combine_directional_losses(
+        soft_forward,
+        soft_backward,
+        eeg_to_image_weight=eeg_to_image_weight,
+        image_to_eeg_weight=image_to_eeg_weight,
+    )
 
-    relation_loss = (
-        relation_alignment_loss(logits, eeg_embeddings, image_embeddings, beta=soft_target_beta)
-        + relation_alignment_loss(logits.T, image_embeddings, eeg_embeddings, beta=soft_target_beta)
-    ) * 0.5
+    relation_forward = relation_alignment_loss(
+        logits,
+        eeg_embeddings,
+        image_embeddings,
+        beta=soft_target_beta,
+        soft_target_source=soft_target_source,
+    )
+    relation_backward = relation_alignment_loss(
+        logits.T,
+        image_embeddings,
+        eeg_embeddings,
+        beta=soft_target_beta,
+        soft_target_source=soft_target_source,
+    )
+    relation_loss = combine_directional_losses(
+        relation_forward,
+        relation_backward,
+        eeg_to_image_weight=eeg_to_image_weight,
+        image_to_eeg_weight=image_to_eeg_weight,
+    )
+
+    hard_negative_loss = logits.new_zeros(())
+    if hard_negative_loss_coef > 0.0 and hard_negative_topk > 0:
+        scores = cosine_similarity_matrix(model, eeg_embeddings, image_embeddings, head=head)
+        hard_negative_forward = hard_negative_margin_loss(
+            scores,
+            margin=hard_negative_margin,
+            topk=hard_negative_topk,
+        )
+        hard_negative_backward = hard_negative_margin_loss(
+            scores.T,
+            margin=hard_negative_margin,
+            topk=hard_negative_topk,
+        )
+        hard_negative_loss = combine_directional_losses(
+            hard_negative_forward,
+            hard_negative_backward,
+            eeg_to_image_weight=eeg_to_image_weight,
+            image_to_eeg_weight=image_to_eeg_weight,
+        )
+    else:
+        hard_negative_forward = logits.new_zeros(())
+        hard_negative_backward = logits.new_zeros(())
 
     total = clip_loss * clip_loss_coef
     total = total + soft_loss * soft_loss_coef
     total = total + relation_loss * relation_loss_coef
+    total = total + hard_negative_loss * hard_negative_loss_coef
     return total, {
         "clip_loss": float(clip_loss.item()),
+        "clip_forward_loss": float(clip_forward.item()),
+        "clip_backward_loss": float(clip_backward.item()),
         "soft_loss": float(soft_loss.item()),
+        "soft_forward_loss": float(soft_forward.item()),
+        "soft_backward_loss": float(soft_backward.item()),
         "relation_loss": float(relation_loss.item()),
+        "relation_forward_loss": float(relation_forward.item()),
+        "relation_backward_loss": float(relation_backward.item()),
+        "hard_negative_loss": float(hard_negative_loss.item()),
+        "hard_negative_forward_loss": float(hard_negative_forward.item()),
+        "hard_negative_backward_loss": float(hard_negative_backward.item()),
     }
 
 
@@ -552,9 +1056,15 @@ def weighted_retrieval_loss(
     perceptual_weight: float = 0.7,
     retrieval_loss_type: str = "clip",
     soft_target_beta: float = 10.0,
+    soft_target_source: str = "blend",
     clip_loss_coef: float = 1.0,
     soft_loss_coef: float = 0.3,
     relation_loss_coef: float = 0.05,
+    eeg_to_image_weight: float = 1.0,
+    image_to_eeg_weight: float = 1.0,
+    hard_negative_loss_coef: float = 0.0,
+    hard_negative_topk: int = 0,
+    hard_negative_margin: float = 0.1,
     target_adapter_loss_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total_loss: torch.Tensor | None = None
@@ -567,8 +1077,17 @@ def weighted_retrieval_loss(
         head: str,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if retrieval_loss_type == "clip":
-            loss = retrieval_loss(model, eeg_embeddings, image_embeddings, head=head)
-            return loss, {}
+            return clip_retrieval_loss(
+                model,
+                eeg_embeddings,
+                image_embeddings,
+                head=head,
+                eeg_to_image_weight=eeg_to_image_weight,
+                image_to_eeg_weight=image_to_eeg_weight,
+                hard_negative_loss_coef=hard_negative_loss_coef,
+                hard_negative_topk=hard_negative_topk,
+                hard_negative_margin=hard_negative_margin,
+            )
         if retrieval_loss_type == "neuroclip":
             return neuroclip_retrieval_loss(
                 model,
@@ -576,9 +1095,15 @@ def weighted_retrieval_loss(
                 image_embeddings,
                 head=head,
                 soft_target_beta=soft_target_beta,
+                soft_target_source=soft_target_source,
                 clip_loss_coef=clip_loss_coef,
                 soft_loss_coef=soft_loss_coef,
                 relation_loss_coef=relation_loss_coef,
+                eeg_to_image_weight=eeg_to_image_weight,
+                image_to_eeg_weight=image_to_eeg_weight,
+                hard_negative_loss_coef=hard_negative_loss_coef,
+                hard_negative_topk=hard_negative_topk,
+                hard_negative_margin=hard_negative_margin,
             )
         raise ValueError(f"Unknown retrieval_loss_type: {retrieval_loss_type}")
 

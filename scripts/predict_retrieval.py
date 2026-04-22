@@ -82,6 +82,18 @@ def resolve_bank(path: Path | None, fallback: str | None, *, name: str) -> Tenso
     return TensorBank.load(bank_path)
 
 
+def resolve_split_bank_path(path: Path, *, split: str) -> Path:
+    suffix_map = {
+        "train": ("_test.pt", "_train.pt"),
+        "test": ("_train.pt", "_test.pt"),
+    }
+    from_suffix, to_suffix = suffix_map.get(split, (None, None))
+    if from_suffix is None or not path.name.endswith(from_suffix):
+        return path
+    candidate = path.with_name(path.name[: -len(from_suffix)] + to_suffix)
+    return candidate if candidate.exists() else path
+
+
 def resolve_alpha(args: argparse.Namespace, payload: dict, has_semantic: bool, has_perceptual: bool) -> float:
     if args.alpha is not None:
         return float(args.alpha)
@@ -105,12 +117,14 @@ def main() -> None:
     model.load_state_dict(payload["model_state"])
     model.eval()
 
-    semantic_bank = resolve_bank(
-        args.semantic_bank,
-        config.get("semantic_bank") or config.get("clip_bank"),
-        name="Semantic",
-    )
-    perceptual_bank = resolve_bank(args.perceptual_bank, config.get("perceptual_bank"), name="Perceptual")
+    semantic_fallback = config.get("semantic_bank") or config.get("clip_bank")
+    perceptual_fallback = config.get("perceptual_bank")
+    if args.semantic_bank is None and semantic_fallback is not None:
+        semantic_fallback = str(resolve_split_bank_path(Path(str(semantic_fallback)), split=args.split))
+    if args.perceptual_bank is None and perceptual_fallback is not None:
+        perceptual_fallback = str(resolve_split_bank_path(Path(str(perceptual_fallback)), split=args.split))
+    semantic_bank = resolve_bank(args.semantic_bank, semantic_fallback, name="Semantic")
+    perceptual_bank = resolve_bank(args.perceptual_bank, perceptual_fallback, name="Perceptual")
     if semantic_bank is None and perceptual_bank is None:
         raise ValueError("At least one of --semantic-bank or --perceptual-bank must resolve to a bank.")
 

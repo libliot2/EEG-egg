@@ -88,19 +88,20 @@ def save_checkpoint(
     scheduler_state: dict[str, Any] | None,
     config: dict[str, Any],
     metrics: dict[str, float],
+    extra_state: dict[str, Any] | None = None,
 ) -> None:
     path = Path(path)
     ensure_dir(path.parent)
-    torch.save(
-        {
-            "model_state": model_state,
-            "optimizer_state": optimizer_state,
-            "scheduler_state": scheduler_state,
-            "config": config,
-            "metrics": metrics,
-        },
-        path,
-    )
+    payload = {
+        "model_state": model_state,
+        "optimizer_state": optimizer_state,
+        "scheduler_state": scheduler_state,
+        "config": config,
+        "metrics": metrics,
+    }
+    if extra_state:
+        payload.update(extra_state)
+    torch.save(payload, path)
 
 
 def image_transform(image_size: int = 256) -> transforms.Compose:

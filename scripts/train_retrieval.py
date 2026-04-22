@@ -76,7 +76,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-dim", type=int, default=768)
     parser.add_argument("--channel-dropout", type=float, default=0.1)
     parser.add_argument("--time-mask-ratio", type=float, default=0.1)
-    parser.add_argument("--encoder-type", choices=["legacy_cnn", "atm_small", "atm_base", "atm_large"], default="atm_small")
+    parser.add_argument(
+        "--encoder-type",
+        choices=["legacy_cnn", "atm_small", "atm_base", "atm_large", "atm_spatial", "atm_multiscale", "eeg_conformer"],
+        default="atm_small",
+    )
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -91,9 +95,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--perceptual-loss-weight", type=float, default=0.7)
     parser.add_argument("--retrieval-loss-type", choices=["clip", "neuroclip"], default="clip")
     parser.add_argument("--soft-target-beta", type=float, default=10.0)
+    parser.add_argument("--soft-target-source", choices=["blend", "image", "eeg"], default="blend")
     parser.add_argument("--clip-loss-coef", type=float, default=1.0)
     parser.add_argument("--soft-loss-coef", type=float, default=0.3)
     parser.add_argument("--relation-loss-coef", type=float, default=0.05)
+    parser.add_argument("--eeg-to-image-loss-weight", type=float, default=1.0)
+    parser.add_argument("--image-to-eeg-loss-weight", type=float, default=1.0)
+    parser.add_argument("--hard-negative-loss-coef", type=float, default=0.0)
+    parser.add_argument("--hard-negative-topk", type=int, default=0)
+    parser.add_argument("--hard-negative-margin", type=float, default=0.1)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--train-no-avg-trials", action="store_true")
     parser.add_argument("--train-trial-sampling", action="store_true")
@@ -182,9 +192,15 @@ def train_one_epoch(
     perceptual_loss_weight: float,
     retrieval_loss_type: str,
     soft_target_beta: float,
+    soft_target_source: str,
     clip_loss_coef: float,
     soft_loss_coef: float,
     relation_loss_coef: float,
+    eeg_to_image_loss_weight: float,
+    image_to_eeg_loss_weight: float,
+    hard_negative_loss_coef: float,
+    hard_negative_topk: int,
+    hard_negative_margin: float,
     grad_accum_steps: int,
     max_grad_norm: float,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None,
@@ -213,9 +229,15 @@ def train_one_epoch(
             perceptual_weight=perceptual_loss_weight,
             retrieval_loss_type=retrieval_loss_type,
             soft_target_beta=soft_target_beta,
+            soft_target_source=soft_target_source,
             clip_loss_coef=clip_loss_coef,
             soft_loss_coef=soft_loss_coef,
             relation_loss_coef=relation_loss_coef,
+            eeg_to_image_weight=eeg_to_image_loss_weight,
+            image_to_eeg_weight=image_to_eeg_loss_weight,
+            hard_negative_loss_coef=hard_negative_loss_coef,
+            hard_negative_topk=hard_negative_topk,
+            hard_negative_margin=hard_negative_margin,
             target_adapter_loss_weight=target_adapter_loss_weight,
         )
         loss = loss / max(1, grad_accum_steps)
@@ -431,9 +453,15 @@ def main() -> None:
         "perceptual_loss_weight": args.perceptual_loss_weight,
         "retrieval_loss_type": args.retrieval_loss_type,
         "soft_target_beta": args.soft_target_beta,
+        "soft_target_source": args.soft_target_source,
         "clip_loss_coef": args.clip_loss_coef,
         "soft_loss_coef": args.soft_loss_coef,
         "relation_loss_coef": args.relation_loss_coef,
+        "eeg_to_image_loss_weight": args.eeg_to_image_loss_weight,
+        "image_to_eeg_loss_weight": args.image_to_eeg_loss_weight,
+        "hard_negative_loss_coef": args.hard_negative_loss_coef,
+        "hard_negative_topk": args.hard_negative_topk,
+        "hard_negative_margin": args.hard_negative_margin,
         "train_avg_trials": not args.train_no_avg_trials and not args.train_trial_sampling,
         "train_trial_sampling": bool(args.train_trial_sampling),
         "train_trial_k_min": int(args.train_trial_k_min),
@@ -480,9 +508,15 @@ def main() -> None:
             perceptual_loss_weight=args.perceptual_loss_weight,
             retrieval_loss_type=args.retrieval_loss_type,
             soft_target_beta=args.soft_target_beta,
+            soft_target_source=args.soft_target_source,
             clip_loss_coef=args.clip_loss_coef,
             soft_loss_coef=args.soft_loss_coef,
             relation_loss_coef=args.relation_loss_coef,
+            eeg_to_image_loss_weight=args.eeg_to_image_loss_weight,
+            image_to_eeg_loss_weight=args.image_to_eeg_loss_weight,
+            hard_negative_loss_coef=args.hard_negative_loss_coef,
+            hard_negative_topk=args.hard_negative_topk,
+            hard_negative_margin=args.hard_negative_margin,
             grad_accum_steps=args.grad_accum_steps,
             max_grad_norm=args.max_grad_norm,
             scheduler=scheduler,
@@ -527,6 +561,12 @@ def main() -> None:
             epoch_metrics["train_semantic_target_adapter_reg"] = float(train_metrics["semantic_target_adapter_reg"])
         if "perceptual_target_adapter_reg" in train_metrics:
             epoch_metrics["train_perceptual_target_adapter_reg"] = float(train_metrics["perceptual_target_adapter_reg"])
+        for key, value in train_metrics.items():
+            if key == "total_loss":
+                continue
+            metric_key = f"train_{key}"
+            if metric_key not in epoch_metrics:
+                epoch_metrics[metric_key] = float(value)
 
         history.append(epoch_metrics)
         alpha_search_history.append({"epoch": epoch, "alpha_results": val_metrics["alpha_history"]})
