@@ -39,6 +39,7 @@ multidict==6.7.1
 multiprocess==0.70.19
 networkx==3.4.2
 numpy==2.2.6
+open_clip_torch==3.3.0
 packaging==26.0
 pandas==2.3.3
 pillow==12.1.1

@@ -36,7 +36,17 @@ def compute_retrieval_outputs(
     device: torch.device,
 ) -> tuple[dict[str, torch.Tensor], list[str], list[str]]:
     model.eval()
-    outputs_by_head: dict[str, list[torch.Tensor]] = {"semantic": [], "perceptual": [], "legacy": []}
+    outputs_by_head: dict[str, list[torch.Tensor]] = {
+        "semantic": [],
+        "perceptual": [],
+        "rerank": [],
+        "legacy": [],
+        "contour": [],
+        "object": [],
+        "context": [],
+        "fused": [],
+        "route_weights": [],
+    }
     image_ids: list[str] = []
     image_paths: list[str] = []
 
@@ -47,8 +57,26 @@ def compute_retrieval_outputs(
             outputs_by_head["semantic"].append(outputs.semantic.float().cpu())
         if outputs.perceptual is not None:
             outputs_by_head["perceptual"].append(outputs.perceptual.float().cpu())
+        rerank_output = getattr(outputs, "rerank", None)
+        if rerank_output is not None:
+            outputs_by_head["rerank"].append(rerank_output.float().cpu())
         if outputs.legacy is not None:
             outputs_by_head["legacy"].append(outputs.legacy.float().cpu())
+        contour_output = getattr(outputs, "contour", None)
+        if contour_output is not None:
+            outputs_by_head["contour"].append(contour_output.float().cpu())
+        object_output = getattr(outputs, "object", None)
+        if object_output is not None:
+            outputs_by_head["object"].append(object_output.float().cpu())
+        context_output = getattr(outputs, "context", None)
+        if context_output is not None:
+            outputs_by_head["context"].append(context_output.float().cpu())
+        fused_output = getattr(outputs, "fused", None)
+        if fused_output is not None:
+            outputs_by_head["fused"].append(fused_output.float().cpu())
+        route_weights = getattr(outputs, "route_weights", None)
+        if route_weights is not None:
+            outputs_by_head["route_weights"].append(route_weights.float().cpu())
         image_ids.extend(list(batch["image_id"]))
         image_paths.extend(list(batch["image_path"]))
 
@@ -71,7 +99,15 @@ def compute_embeddings(
     outputs, image_ids, image_paths = compute_retrieval_outputs(model, loader, device)
     resolved_head = head
     if resolved_head is None:
-        if "semantic" in outputs:
+        if "fused" in outputs:
+            resolved_head = "fused"
+        elif "context" in outputs:
+            resolved_head = "context"
+        elif "object" in outputs:
+            resolved_head = "object"
+        elif "contour" in outputs:
+            resolved_head = "contour"
+        elif "semantic" in outputs:
             resolved_head = "semantic"
         elif "perceptual" in outputs:
             resolved_head = "perceptual"
@@ -83,22 +119,19 @@ def compute_embeddings(
 
 
 def _resolve_candidate_image_ids(
-    semantic_bank: TensorBank | None,
-    perceptual_bank: TensorBank | None,
+    *banks: TensorBank | None,
     candidate_image_ids: Iterable[str] | None = None,
 ) -> list[str]:
     if candidate_image_ids is not None:
         return list(candidate_image_ids)
 
-    if semantic_bank is not None:
-        base_ids = list(semantic_bank.image_ids)
-    elif perceptual_bank is not None:
-        base_ids = list(perceptual_bank.image_ids)
-    else:
+    resolved_banks = [bank for bank in banks if bank is not None]
+    if not resolved_banks:
         raise ValueError("At least one candidate bank is required.")
-
-    if semantic_bank is not None and perceptual_bank is not None and semantic_bank.image_ids != perceptual_bank.image_ids:
-        raise ValueError("Semantic and perceptual banks must share the same candidate ordering.")
+    base_ids = list(resolved_banks[0].image_ids)
+    for bank in resolved_banks[1:]:
+        if bank.image_ids != base_ids:
+            raise ValueError("All retrieval banks must share the same candidate ordering.")
     return base_ids
 
 
@@ -127,10 +160,26 @@ def compute_retrieval_logits(
     *,
     semantic_bank: TensorBank | None = None,
     perceptual_bank: TensorBank | None = None,
+    rerank_bank: TensorBank | None = None,
+    contour_bank: TensorBank | None = None,
+    object_bank: TensorBank | None = None,
+    context_bank: TensorBank | None = None,
+    fused_bank: TensorBank | None = None,
     candidate_image_ids: Iterable[str] | None = None,
     alpha: float = 0.5,
+    rerank_alpha: float = 0.0,
+    rerank_topk: int = 0,
 ) -> tuple[torch.Tensor, list[str], dict[str, torch.Tensor]]:
-    candidate_ids = _resolve_candidate_image_ids(semantic_bank, perceptual_bank, candidate_image_ids)
+    candidate_ids = _resolve_candidate_image_ids(
+        semantic_bank,
+        perceptual_bank,
+        rerank_bank,
+        contour_bank,
+        object_bank,
+        context_bank,
+        fused_bank,
+        candidate_image_ids=candidate_image_ids,
+    )
     model_device = next(model.parameters()).device
     component_logits: dict[str, torch.Tensor] = {}
 
@@ -155,14 +204,93 @@ def compute_retrieval_logits(
             head="perceptual",
         ).cpu()
 
+    coarse_logits: torch.Tensor | None = None
+    route_logits: torch.Tensor | None = None
+
     if "semantic" in component_logits and "perceptual" in component_logits:
-        fused = alpha * component_logits["semantic"] + (1.0 - alpha) * component_logits["perceptual"]
+        coarse_logits = alpha * component_logits["semantic"] + (1.0 - alpha) * component_logits["perceptual"]
     elif "semantic" in component_logits:
-        fused = component_logits["semantic"]
+        coarse_logits = component_logits["semantic"]
     elif "perceptual" in component_logits:
-        fused = component_logits["perceptual"]
+        coarse_logits = component_logits["perceptual"]
+
+    if outputs.get("contour") is not None or outputs.get("object") is not None or outputs.get("context") is not None:
+        if outputs.get("contour") is not None and contour_bank is not None:
+            contour_values = contour_bank.align(candidate_ids, device=model_device).float()
+            component_logits["contour"] = model.similarity(
+                outputs["contour"].to(model_device),
+                contour_values,
+                head="contour",
+            ).cpu()
+        if outputs.get("object") is not None and object_bank is not None:
+            object_values = object_bank.align(candidate_ids, device=model_device).float()
+            component_logits["object"] = model.similarity(
+                outputs["object"].to(model_device),
+                object_values,
+                head="object",
+            ).cpu()
+        if outputs.get("context") is not None and context_bank is not None:
+            context_values = context_bank.align(candidate_ids, device=model_device).float()
+            component_logits["context"] = model.similarity(
+                outputs["context"].to(model_device),
+                context_values,
+                head="context",
+            ).cpu()
+        if outputs.get("fused") is not None and fused_bank is not None:
+            fused_values = fused_bank.align(candidate_ids, device=model_device).float()
+            component_logits["fused"] = model.similarity(
+                outputs["fused"].to(model_device),
+                fused_values,
+                head="fused",
+            ).cpu()
+
+        branch_names = [name for name in ["contour", "object", "context", "fused"] if name in component_logits]
+        if not branch_names:
+            raise ValueError("No visible retrieval branches were available for the requested banks.")
+        if outputs.get("route_weights") is not None:
+            route_index = {"contour": 0, "object": 1, "context": 2, "fused": 3}
+            weights = outputs["route_weights"][:, [route_index[name] for name in branch_names]].cpu()
+            weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            stacked = torch.stack([component_logits[name] for name in branch_names], dim=1)
+            route_logits = (weights.unsqueeze(-1) * stacked).sum(dim=1)
+            component_logits["route"] = route_logits
+        elif "fused" in component_logits:
+            route_logits = component_logits["fused"]
+            component_logits["route"] = route_logits
+        else:
+            route_logits = torch.stack([component_logits[name] for name in branch_names], dim=0).mean(dim=0)
+            component_logits["route"] = route_logits
+
+    if coarse_logits is not None and route_logits is not None:
+        fused = alpha * coarse_logits + (1.0 - alpha) * route_logits
+    elif coarse_logits is not None:
+        fused = coarse_logits
+    elif route_logits is not None:
+        fused = route_logits
     else:
         raise ValueError("No compatible retrieval heads were available for the requested banks.")
+
+    if coarse_logits is not None:
+        component_logits["coarse"] = coarse_logits
+    component_logits["hybrid"] = fused
+
+    if outputs.get("rerank") is not None and rerank_bank is not None and rerank_alpha > 0.0 and rerank_topk > 0:
+        rerank_values = rerank_bank.align(candidate_ids, device=model_device).float()
+        rerank_logits = model.similarity(
+            outputs["rerank"].to(model_device),
+            rerank_values,
+            head="rerank",
+        ).cpu()
+        component_logits["rerank"] = rerank_logits
+        topk = min(int(rerank_topk), fused.shape[1])
+        if topk > 0:
+            reranked = fused.clone()
+            topk_indices = fused.topk(k=topk, dim=1).indices
+            row_indices = torch.arange(fused.shape[0]).unsqueeze(1)
+            reranked[row_indices, topk_indices] = reranked[row_indices, topk_indices] + (
+                rerank_alpha * rerank_logits[row_indices, topk_indices]
+            )
+            fused = reranked
 
     return fused, candidate_ids, component_logits
 

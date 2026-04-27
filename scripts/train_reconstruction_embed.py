@@ -40,6 +40,29 @@ from project1_eeg.utils import (
 )
 
 
+CHANNEL_PRESETS: dict[str, list[str]] = {
+    "visual17": [
+        "P7",
+        "P5",
+        "P3",
+        "P1",
+        "Pz",
+        "P2",
+        "P4",
+        "P6",
+        "P8",
+        "PO7",
+        "PO3",
+        "POz",
+        "PO4",
+        "PO8",
+        "O1",
+        "Oz",
+        "O2",
+    ]
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train EEG-to-image-embedding reconstruction model.")
     parser.add_argument("--retrieval-checkpoint", type=Path, required=True)
@@ -115,7 +138,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-cosine-weight", type=float, default=0.1)
     parser.add_argument("--residual-l2-weight", type=float, default=0.02)
     parser.add_argument("--attention-heads", type=int, default=8)
+    parser.add_argument("--selected-channels", nargs="+", default=None)
+    parser.add_argument("--channel-preset", choices=sorted(CHANNEL_PRESETS.keys()), default=None)
+    parser.add_argument("--channel-subset-name", type=str, default=None)
     return parser.parse_args()
+
+
+def resolve_selected_channels(args: argparse.Namespace, retrieval_config: dict) -> list[str] | None:
+    if args.selected_channels is not None:
+        return list(args.selected_channels)
+    if args.channel_preset is not None:
+        return list(CHANNEL_PRESETS[args.channel_preset])
+    if args.channel_subset_name is not None:
+        selected_channels = retrieval_config.get("selected_channels")
+        if not selected_channels:
+            raise ValueError(
+                f"--channel-subset-name={args.channel_subset_name} was provided, but the retrieval checkpoint "
+                "does not store selected_channels."
+            )
+        return list(selected_channels)
+    if retrieval_config.get("selected_channels") is not None:
+        return list(retrieval_config["selected_channels"])
+    return None
 
 
 def average_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
@@ -780,6 +824,7 @@ def main() -> None:
         device=device,
         retrieval_bank_path=args.retrieval_bank,
     )
+    selected_channels = resolve_selected_channels(args, retrieval_assets["config"])
     retrieval_bank = retrieval_assets["retrieval_bank"]
     text_bank_path = resolve_artifact_path(
         args.text_bank,
@@ -832,12 +877,14 @@ def main() -> None:
         split="train",
         avg_trials=True,
         image_ids=train_ids,
+        selected_channels=selected_channels,
     )
     val_records = load_eeg_records(
         data_dir=args.data_dir,
         split="train",
         avg_trials=True,
         image_ids=val_ids,
+        selected_channels=selected_channels,
     )
 
     train_loader = make_dataloader(
@@ -887,6 +934,7 @@ def main() -> None:
         "backbone_dim": int(backbone_dim),
         "retrieval_checkpoint": str(args.retrieval_checkpoint),
         "retrieval_config": retrieval_assets["config"],
+        "selected_channels": selected_channels,
         "teacher_head": retrieval_assets["teacher_head"],
         "train_avg_trials": True,
         "val_avg_trials": True,

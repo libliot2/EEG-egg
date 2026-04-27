@@ -8,11 +8,19 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from project1_eeg.data import EEGImageDataset, load_eeg_records, make_train_val_split, ordered_image_ids
-from project1_eeg.image_banks import TensorBank
+from project1_eeg.data import (
+    DEFAULT_CHANNEL_SUBSET_FILE,
+    EEGImageDataset,
+    load_eeg_records,
+    make_train_val_split,
+    ordered_image_ids,
+    resolve_channel_subset,
+)
+from project1_eeg.image_banks import TeacherLogitsBank, TensorBank
 from project1_eeg.retrieval import RetrievalModel, weighted_retrieval_loss
 from project1_eeg.runtime import (
     compute_retrieval_logits,
@@ -78,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-mask-ratio", type=float, default=0.1)
     parser.add_argument(
         "--encoder-type",
-        choices=["legacy_cnn", "atm_small", "atm_base", "atm_large", "atm_spatial", "atm_multiscale", "eeg_conformer"],
+        choices=["legacy_cnn", "atm_small", "atm_base", "atm_large", "atm_spatial", "atm_multiscale", "eeg_conformer", "atm_region_expert", "atm_posterior_expert"],
         default="atm_small",
     )
     parser.add_argument("--transformer-layers", type=int, default=2)
@@ -91,6 +99,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-adapter-dropout", type=float, default=0.1)
     parser.add_argument("--target-adapter-beta", type=float, default=0.1)
     parser.add_argument("--target-adapter-loss-weight", type=float, default=0.0)
+    parser.add_argument("--use-channel-gate", action="store_true")
+    parser.add_argument("--channel-gate-loss-weight", type=float, default=0.0)
     parser.add_argument("--semantic-loss-weight", type=float, default=1.0)
     parser.add_argument("--perceptual-loss-weight", type=float, default=0.7)
     parser.add_argument("--retrieval-loss-type", choices=["clip", "neuroclip"], default="clip")
@@ -104,6 +114,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hard-negative-loss-coef", type=float, default=0.0)
     parser.add_argument("--hard-negative-topk", type=int, default=0)
     parser.add_argument("--hard-negative-margin", type=float, default=0.1)
+    parser.add_argument("--teacher-logits-bank", type=Path, default=None)
+    parser.add_argument("--teacher-distill-weight", type=float, default=0.1)
+    parser.add_argument("--teacher-distill-temperature", type=float, default=2.0)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--train-no-avg-trials", action="store_true")
     parser.add_argument("--train-trial-sampling", action="store_true")
@@ -111,6 +124,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-trial-k-max", type=int, default=4)
     parser.add_argument("--selected-channels", nargs="+", default=None)
     parser.add_argument("--channel-preset", choices=sorted(CHANNEL_PRESETS.keys()), default=None)
+    parser.add_argument("--channel-subset-name", type=str, default=None)
+    parser.add_argument("--channel-subset-file", type=Path, default=DEFAULT_CHANNEL_SUBSET_FILE)
     parser.add_argument("--selection-metric", choices=["top1", "top5", "blend_top1_top5"], default="blend_top1_top5")
     parser.add_argument("--save-every-epoch", action="store_true")
     parser.add_argument("--keep-last-k", type=int, default=5)
@@ -121,12 +136,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_selected_channels(args: argparse.Namespace) -> list[str] | None:
-    if args.selected_channels and args.channel_preset:
-        raise ValueError("--selected-channels and --channel-preset cannot both be set.")
+    explicit_sources = sum(
+        bool(value)
+        for value in (args.selected_channels, args.channel_preset, args.channel_subset_name)
+    )
+    if explicit_sources > 1:
+        raise ValueError("--selected-channels, --channel-preset, and --channel-subset-name are mutually exclusive.")
     if args.selected_channels:
         return [str(channel) for channel in args.selected_channels]
     if args.channel_preset:
         return list(CHANNEL_PRESETS[args.channel_preset])
+    if args.channel_subset_name:
+        return resolve_channel_subset(args.channel_subset_name, subset_file=args.channel_subset_file)
     return None
 
 
@@ -136,6 +157,14 @@ def load_bank(path: Path | None, *, name: str) -> TensorBank | None:
     if not path.exists():
         raise FileNotFoundError(f"{name} bank not found: {path}.")
     return TensorBank.load(path)
+
+
+def load_teacher_logits_bank(path: Path | None) -> TeacherLogitsBank | None:
+    if path is None:
+        return None
+    if not path.exists():
+        raise FileNotFoundError(f"Teacher logits bank not found: {path}.")
+    return TeacherLogitsBank.load(path)
 
 
 def apply_freeze_options(model: RetrievalModel, args: argparse.Namespace) -> None:
@@ -186,6 +215,7 @@ def train_one_epoch(
     *,
     semantic_bank: TensorBank | None,
     perceptual_bank: TensorBank | None,
+    teacher_logits_bank: TeacherLogitsBank | None,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     semantic_loss_weight: float,
@@ -201,10 +231,13 @@ def train_one_epoch(
     hard_negative_loss_coef: float,
     hard_negative_topk: int,
     hard_negative_margin: float,
+    teacher_distill_weight: float,
+    teacher_distill_temperature: float,
     grad_accum_steps: int,
     max_grad_norm: float,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     target_adapter_loss_weight: float,
+    channel_gate_loss_weight: float,
 ) -> dict[str, float]:
     model.train()
     metrics: list[dict[str, float]] = []
@@ -240,6 +273,29 @@ def train_one_epoch(
             hard_negative_margin=hard_negative_margin,
             target_adapter_loss_weight=target_adapter_loss_weight,
         )
+        if teacher_logits_bank is not None and teacher_distill_weight > 0.0:
+            if outputs.perceptual is None or perceptual_targets is None:
+                raise ValueError("Teacher logit distillation requires a perceptual head and perceptual targets.")
+            temperature = float(teacher_distill_temperature)
+            if temperature <= 0.0:
+                raise ValueError("--teacher-distill-temperature must be positive.")
+            student_logits = model.similarity(
+                outputs.perceptual,
+                perceptual_targets,
+                head="perceptual",
+            )
+            teacher_logits = teacher_logits_bank.align_square(batch["image_id"], device=device).float()
+            teacher_probs = torch.softmax(teacher_logits / temperature, dim=-1)
+            student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+            distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature ** 2)
+            loss = loss + float(teacher_distill_weight) * distill_loss
+            batch_metrics["teacher_distill_loss"] = float(distill_loss.item())
+            batch_metrics["total_loss"] = float(loss.item())
+        channel_gate_reg = model.channel_gate_regularization()
+        if channel_gate_reg is not None and channel_gate_loss_weight > 0.0:
+            loss = loss + channel_gate_reg * float(channel_gate_loss_weight)
+            batch_metrics["channel_gate_reg"] = float(channel_gate_reg.item())
+            batch_metrics["total_loss"] = float(loss.item())
         loss = loss / max(1, grad_accum_steps)
 
         loss.backward()
@@ -326,6 +382,7 @@ def main() -> None:
 
     semantic_bank = load_bank(args.semantic_bank, name="Semantic") if args.semantic_bank is not None else None
     perceptual_bank = load_bank(args.perceptual_bank, name="Perceptual") if args.perceptual_bank is not None else None
+    teacher_logits_bank = load_teacher_logits_bank(args.teacher_logits_bank)
     if semantic_bank is None and perceptual_bank is None:
         raise ValueError("At least one of --semantic-bank or --perceptual-bank must be provided.")
 
@@ -397,6 +454,7 @@ def main() -> None:
         target_adapter_hidden_dim=args.target_adapter_hidden_dim,
         target_adapter_dropout=args.target_adapter_dropout,
         target_adapter_beta=args.target_adapter_beta,
+        use_channel_gate=args.use_channel_gate,
     ).to(device)
     if args.init_checkpoint is not None:
         payload = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
@@ -447,6 +505,8 @@ def main() -> None:
         "target_adapter_dropout": float(args.target_adapter_dropout),
         "target_adapter_beta": float(args.target_adapter_beta),
         "target_adapter_loss_weight": float(args.target_adapter_loss_weight),
+        "use_channel_gate": bool(args.use_channel_gate),
+        "channel_gate_loss_weight": float(args.channel_gate_loss_weight),
         "semantic_dim": semantic_dim,
         "perceptual_dim": perceptual_dim,
         "semantic_loss_weight": args.semantic_loss_weight,
@@ -462,6 +522,9 @@ def main() -> None:
         "hard_negative_loss_coef": args.hard_negative_loss_coef,
         "hard_negative_topk": args.hard_negative_topk,
         "hard_negative_margin": args.hard_negative_margin,
+        "teacher_logits_bank": None if args.teacher_logits_bank is None else str(args.teacher_logits_bank),
+        "teacher_distill_weight": args.teacher_distill_weight,
+        "teacher_distill_temperature": args.teacher_distill_temperature,
         "train_avg_trials": not args.train_no_avg_trials and not args.train_trial_sampling,
         "train_trial_sampling": bool(args.train_trial_sampling),
         "train_trial_k_min": int(args.train_trial_k_min),
@@ -469,6 +532,8 @@ def main() -> None:
         "val_avg_trials": True,
         "selected_channels": selected_channels,
         "channel_preset": args.channel_preset,
+        "channel_subset_name": args.channel_subset_name,
+        "channel_subset_file": str(args.channel_subset_file),
         "in_channels": in_channels,
         "semantic_bank": None if args.semantic_bank is None else str(args.semantic_bank),
         "perceptual_bank": None if args.perceptual_bank is None else str(args.perceptual_bank),
@@ -502,6 +567,7 @@ def main() -> None:
             train_loader,
             semantic_bank=semantic_bank,
             perceptual_bank=perceptual_bank,
+            teacher_logits_bank=teacher_logits_bank,
             optimizer=optimizer,
             device=device,
             semantic_loss_weight=args.semantic_loss_weight,
@@ -517,10 +583,13 @@ def main() -> None:
             hard_negative_loss_coef=args.hard_negative_loss_coef,
             hard_negative_topk=args.hard_negative_topk,
             hard_negative_margin=args.hard_negative_margin,
+            teacher_distill_weight=args.teacher_distill_weight,
+            teacher_distill_temperature=args.teacher_distill_temperature,
             grad_accum_steps=args.grad_accum_steps,
             max_grad_norm=args.max_grad_norm,
             scheduler=scheduler,
             target_adapter_loss_weight=args.target_adapter_loss_weight,
+            channel_gate_loss_weight=args.channel_gate_loss_weight,
         )
         val_metrics = evaluate(
             model,
@@ -561,6 +630,8 @@ def main() -> None:
             epoch_metrics["train_semantic_target_adapter_reg"] = float(train_metrics["semantic_target_adapter_reg"])
         if "perceptual_target_adapter_reg" in train_metrics:
             epoch_metrics["train_perceptual_target_adapter_reg"] = float(train_metrics["perceptual_target_adapter_reg"])
+        if "channel_gate_reg" in train_metrics:
+            epoch_metrics["train_channel_gate_reg"] = float(train_metrics["channel_gate_reg"])
         for key, value in train_metrics.items():
             if key == "total_loss":
                 continue

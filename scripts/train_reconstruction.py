@@ -92,13 +92,13 @@ def resolve_bank(path: Path | None, fallback: str | None, *, name: str) -> Tenso
 def resolve_alpha(args: argparse.Namespace, retrieval_payload: dict, has_semantic: bool, has_perceptual: bool) -> float:
     if args.alpha is not None:
         return float(args.alpha)
+    metrics = retrieval_payload.get("metrics", {})
+    if "val_selected_alpha" in metrics:
+        return float(metrics["val_selected_alpha"])
     if not has_semantic:
         return 0.0
     if not has_perceptual:
         return 1.0
-    metrics = retrieval_payload.get("metrics", {})
-    if "val_selected_alpha" in metrics:
-        return float(metrics["val_selected_alpha"])
     return 0.5
 
 

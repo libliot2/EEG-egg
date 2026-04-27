@@ -71,6 +71,53 @@ class TensorBank:
         )
 
 
+@dataclass
+class TeacherLogitsBank:
+    query_image_ids: list[str]
+    candidate_image_ids: list[str]
+    logits: torch.Tensor
+    metadata: dict[str, Any] = field(default_factory=dict)
+    _query_index: dict[str, int] = field(init=False, repr=False, default_factory=dict)
+    _candidate_index: dict[str, int] = field(init=False, repr=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self._query_index = {image_id: idx for idx, image_id in enumerate(self.query_image_ids)}
+        self._candidate_index = {image_id: idx for idx, image_id in enumerate(self.candidate_image_ids)}
+
+    def align_square(self, image_ids: Iterable[str], *, device: torch.device | None = None) -> torch.Tensor:
+        image_ids = list(image_ids)
+        row_indices = torch.tensor([self._query_index[image_id] for image_id in image_ids], dtype=torch.long)
+        col_indices = torch.tensor([self._candidate_index[image_id] for image_id in image_ids], dtype=torch.long)
+        values = self.logits.index_select(0, row_indices).index_select(1, col_indices)
+        if device is not None:
+            values = values.to(device)
+        return values
+
+    def save(self, path: str | Path) -> Path:
+        path = Path(path)
+        ensure_dir(path.parent)
+        torch.save(
+            {
+                "query_image_ids": self.query_image_ids,
+                "candidate_image_ids": self.candidate_image_ids,
+                "logits": self.logits.cpu(),
+                "metadata": self.metadata,
+            },
+            path,
+        )
+        return path
+
+    @classmethod
+    def load(cls, path: str | Path, map_location: str | torch.device = "cpu") -> "TeacherLogitsBank":
+        payload = torch.load(path, map_location=map_location, weights_only=False)
+        return cls(
+            query_image_ids=list(payload["query_image_ids"]),
+            candidate_image_ids=list(payload["candidate_image_ids"]),
+            logits=torch.as_tensor(payload["logits"]),
+            metadata=dict(payload.get("metadata", {})),
+        )
+
+
 def default_bank_path(output_dir: str | Path, bank_type: str, split: str) -> Path:
     return Path(output_dir) / "cache" / f"{bank_type}_{split}.pt"
 

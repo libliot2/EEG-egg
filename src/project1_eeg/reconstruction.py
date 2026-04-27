@@ -87,6 +87,31 @@ class EEGEmbeddingRegressor(nn.Module):
                 yield parameter
 
 
+class EmbeddingAdapter(nn.Module):
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int = 2048,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.network(inputs)
+
+
 class CrossAttentionBlock(nn.Module):
     def __init__(
         self,

@@ -36,7 +36,11 @@ pip-wheel-metadata/
 EXPERIMENT_LOG_hpc.md
 
 # Generated experiment artifacts
+outputs
 outputs/
+outputs_local
+outputs_local/
+.tmp
 wandb/
 mlruns/
 runs/
@@ -48,6 +52,7 @@ image-eeg-data/
 cache/
 
 # Large model weights and checkpoints
+models
 models/checkpoints/
 models/ensemble_lora/
 models/*.pt

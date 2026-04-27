@@ -15,6 +15,7 @@ from .utils import DEFAULT_DATA_DIR, load_json
 SplitName = Literal["train", "test"]
 ImageIdSource = Literal["all", "train_ids", "val_ids"]
 TrialSamplingMode = Literal["none", "random_avg"]
+DEFAULT_CHANNEL_SUBSET_FILE = Path(__file__).resolve().parents[2] / "configs" / "channel_subsets.json"
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,37 @@ def _selected_channel_indices_from_jsonl(
         raise ValueError(f"Unknown EEG channels: {missing}")
 
     return [name_to_index[channel] for channel in selected_channels]
+
+
+def load_channel_subset_registry(path: str | Path = DEFAULT_CHANNEL_SUBSET_FILE) -> dict[str, list[str]]:
+    payload = load_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Channel subset registry must be a JSON object: {path}")
+
+    registry: dict[str, list[str]] = {}
+    for name, channels in payload.items():
+        if not isinstance(name, str):
+            raise ValueError(f"Channel subset names must be strings: {path}")
+        if not isinstance(channels, list) or not all(isinstance(channel, str) for channel in channels):
+            raise ValueError(f"Channel subset '{name}' must map to a list of strings in {path}")
+        if len(channels) != len(set(channels)):
+            raise ValueError(f"Channel subset '{name}' contains duplicate channel names in {path}")
+        registry[name] = list(channels)
+    return registry
+
+
+def resolve_channel_subset(
+    subset_name: str | None,
+    *,
+    subset_file: str | Path = DEFAULT_CHANNEL_SUBSET_FILE,
+) -> list[str] | None:
+    if subset_name is None:
+        return None
+    registry = load_channel_subset_registry(subset_file)
+    if subset_name not in registry:
+        available = ", ".join(sorted(registry))
+        raise KeyError(f"Unknown channel subset '{subset_name}'. Available subsets: {available}")
+    return registry[subset_name]
 
 
 def resolve_image_path(data_dir: str | Path, raw_path: str, split: SplitName) -> Path:

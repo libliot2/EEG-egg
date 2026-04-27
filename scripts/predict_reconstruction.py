@@ -27,6 +27,29 @@ from project1_eeg.runtime import (
 from project1_eeg.utils import DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR, load_image_batch, resolve_device, save_json
 
 
+CHANNEL_PRESETS: dict[str, list[str]] = {
+    "visual17": [
+        "P7",
+        "P5",
+        "P3",
+        "P1",
+        "Pz",
+        "P2",
+        "P4",
+        "P6",
+        "P8",
+        "PO7",
+        "PO3",
+        "POz",
+        "PO4",
+        "PO8",
+        "O1",
+        "Oz",
+        "O2",
+    ]
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate reconstruction outputs for train/test splits.")
     parser.add_argument("--retrieval-checkpoint", type=Path, required=True)
@@ -47,6 +70,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-id-source", choices=["all", "train_ids", "val_ids"], default="all")
     parser.add_argument("--prototype-topk", type=int, default=None)
     parser.add_argument("--prototype-mode", choices=["top1", "score_weighted_topk"], default=None)
+    parser.add_argument("--selected-channels", nargs="+", default=None)
+    parser.add_argument("--channel-preset", choices=sorted(CHANNEL_PRESETS.keys()), default=None)
+    parser.add_argument("--channel-subset-name", type=str, default=None)
     return parser.parse_args()
 
 
@@ -98,14 +124,32 @@ def resolve_alpha(
         return float(args.alpha)
     if reconstruction_config is not None and "alpha" in reconstruction_config:
         return float(reconstruction_config["alpha"])
+    metrics = retrieval_payload.get("metrics", {})
+    if "val_selected_alpha" in metrics:
+        return float(metrics["val_selected_alpha"])
     if not has_semantic:
         return 0.0
     if not has_perceptual:
         return 1.0
-    metrics = retrieval_payload.get("metrics", {})
-    if "val_selected_alpha" in metrics:
-        return float(metrics["val_selected_alpha"])
     return 0.5
+
+
+def resolve_selected_channels(args: argparse.Namespace, retrieval_config: dict) -> list[str] | None:
+    if args.selected_channels is not None:
+        return list(args.selected_channels)
+    if args.channel_preset is not None:
+        return list(CHANNEL_PRESETS[args.channel_preset])
+    if args.channel_subset_name is not None:
+        selected_channels = retrieval_config.get("selected_channels")
+        if not selected_channels:
+            raise ValueError(
+                f"--channel-subset-name={args.channel_subset_name} was provided, but the retrieval checkpoint "
+                "does not store selected_channels."
+            )
+        return list(selected_channels)
+    if retrieval_config.get("selected_channels") is not None:
+        return list(retrieval_config["selected_channels"])
+    return None
 
 
 def main() -> None:
@@ -153,10 +197,12 @@ def main() -> None:
         prototype_mode = "top1" if recon_config is None else str(recon_config.get("prototype_mode", "top1"))
 
     selected_image_ids = load_split_image_ids(args.split_file, image_id_source=args.image_id_source)
+    selected_channels = resolve_selected_channels(args, retrieval_config)
     records = load_eeg_records(
         data_dir=args.data_dir,
         split=args.split,
         avg_trials=True,
+        selected_channels=selected_channels,
         image_ids=selected_image_ids,
     )
     loader = make_dataloader(

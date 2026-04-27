@@ -23,7 +23,7 @@ from project1_eeg.kandinsky import (
     load_kandinsky_prior_pipeline,
     negative_image_embed_from_bank,
 )
-from project1_eeg.reconstruction import EEGEmbeddingRegressor, GatedRetrievalResidualRegressor
+from project1_eeg.reconstruction import EEGEmbeddingRegressor, EmbeddingAdapter, GatedRetrievalResidualRegressor
 from project1_eeg.retrieval import build_retrieval_model_from_config
 from project1_eeg.runtime import compute_retrieval_logits, make_dataloader, prototype_lookup_from_logits, save_image_batch
 from project1_eeg.utils import (
@@ -36,6 +36,29 @@ from project1_eeg.utils import (
 )
 
 
+CHANNEL_PRESETS: dict[str, list[str]] = {
+    "visual17": [
+        "P7",
+        "P5",
+        "P3",
+        "P1",
+        "Pz",
+        "P2",
+        "P4",
+        "P6",
+        "P8",
+        "PO7",
+        "PO3",
+        "POz",
+        "PO4",
+        "PO8",
+        "O1",
+        "Oz",
+        "O2",
+    ]
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate reconstructions from EEG via Kandinsky image embeddings.")
     parser.add_argument("--reconstruction-checkpoint", type=Path, default=None)
@@ -45,8 +68,15 @@ def parse_args() -> argparse.Namespace:
         "--embedding-bank",
         type=Path,
         default=None,
-        help="Defaults to the bank recorded in the reconstruction checkpoint config.",
+        help="Generation bank for the Kandinsky decoder. Defaults to the bank recorded in the reconstruction checkpoint config.",
     )
+    parser.add_argument(
+        "--conditioning-bank",
+        type=Path,
+        default=None,
+        help="Optional source bank used to produce conditioning embeddings before any adapter is applied.",
+    )
+    parser.add_argument("--conditioning-adapter", type=Path, default=None)
     parser.add_argument("--retrieval-bank", type=Path, default=None)
     parser.add_argument("--text-bank", type=Path, default=None)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
@@ -80,9 +110,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init-image-dir", type=Path, default=None)
     parser.add_argument("--img2img-strength", type=float, default=0.5)
     parser.add_argument("--candidate-seed-offset", type=int, default=0)
+    parser.add_argument(
+        "--candidate-selection-mode",
+        choices=["semantic", "semantic_lowlevel"],
+        default="semantic",
+        help="How to select the best image among decoder candidates.",
+    )
+    parser.add_argument(
+        "--candidate-lowlevel-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the low-level init-image similarity term when using semantic_lowlevel selection.",
+    )
+    parser.add_argument(
+        "--candidate-lowlevel-metric",
+        choices=["pixel_cosine", "neg_mse"],
+        default="pixel_cosine",
+    )
+    parser.add_argument(
+        "--candidate-score-normalization",
+        choices=["none", "per_query_minmax", "per_query_zscore"],
+        default="per_query_minmax",
+    )
     parser.add_argument("--retrieval-topk", type=int, default=None)
     parser.add_argument("--use-text-context", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--selected-channels", nargs="+", default=None)
+    parser.add_argument("--channel-preset", choices=sorted(CHANNEL_PRESETS.keys()), default=None)
+    parser.add_argument("--channel-subset-name", type=str, default=None)
     return parser.parse_args()
 
 
@@ -111,13 +166,13 @@ def resolve_bank(path: Path | None, fallback: str | None, *, name: str, base_pat
 def resolve_alpha(args: argparse.Namespace, payload: dict, *, has_semantic: bool, has_perceptual: bool) -> float:
     if args.alpha is not None:
         return float(args.alpha)
+    metrics = payload.get("metrics", {})
+    if "val_selected_alpha" in metrics:
+        return float(metrics["val_selected_alpha"])
     if not has_semantic:
         return 0.0
     if not has_perceptual:
         return 1.0
-    metrics = payload.get("metrics", {})
-    if "val_selected_alpha" in metrics:
-        return float(metrics["val_selected_alpha"])
     return 0.5
 
 
@@ -138,6 +193,25 @@ def resolve_embedding_bank_path(args: argparse.Namespace, config: dict | None, c
         "Unable to resolve an embedding bank. Pass --embedding-bank or provide a reconstruction checkpoint "
         "whose config contains `embedding_bank`."
     )
+
+
+def resolve_conditioning_bank_path(
+    args: argparse.Namespace,
+    config: dict | None,
+    checkpoint_path: Path | None,
+    *,
+    generation_bank_path: Path,
+) -> Path:
+    if args.conditioning_bank is not None:
+        return args.conditioning_bank
+    if config is not None and config.get("embedding_bank"):
+        resolved = resolve_artifact_path(
+            config["embedding_bank"],
+            base_paths=[PROJECT_ROOT, checkpoint_path.parent if checkpoint_path is not None else PROJECT_ROOT],
+        )
+        if resolved is not None:
+            return resolved
+    return generation_bank_path
 
 
 def resolve_generation_config(
@@ -214,6 +288,20 @@ def load_embedding_model(checkpoint_path: Path, device: torch.device):
     return model, config, model_type
 
 
+def load_conditioning_adapter(checkpoint_path: Path, device: torch.device) -> tuple[EmbeddingAdapter, dict]:
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    config = payload["config"]
+    model = EmbeddingAdapter(
+        input_dim=int(config["input_dim"]),
+        output_dim=int(config["output_dim"]),
+        hidden_dim=int(config.get("hidden_dim", 2048)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    model.load_state_dict(payload["model_state"])
+    model.eval()
+    return model, config
+
+
 def load_retrieval_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, dict, dict]:
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = payload["config"]
@@ -223,6 +311,36 @@ def load_retrieval_model(checkpoint_path: Path, device: torch.device) -> tuple[t
     for parameter in model.parameters():
         parameter.requires_grad = False
     return model, config, payload
+
+
+def resolve_selected_channels(
+    args: argparse.Namespace,
+    *,
+    embedding_config: dict | None,
+    retrieval_config: dict | None,
+) -> list[str] | None:
+    if args.selected_channels is not None:
+        return list(args.selected_channels)
+    if args.channel_preset is not None:
+        return list(CHANNEL_PRESETS[args.channel_preset])
+    if args.channel_subset_name is not None:
+        source_config = retrieval_config or (embedding_config.get("retrieval_config") if embedding_config else None)
+        selected_channels = None if source_config is None else source_config.get("selected_channels")
+        if not selected_channels:
+            raise ValueError(
+                f"--channel-subset-name={args.channel_subset_name} was provided, but no selected_channels "
+                "were stored in the checkpoint config."
+            )
+        return list(selected_channels)
+    if retrieval_config is not None and retrieval_config.get("selected_channels") is not None:
+        return list(retrieval_config["selected_channels"])
+    if embedding_config is not None:
+        if embedding_config.get("selected_channels") is not None:
+            return list(embedding_config["selected_channels"])
+        nested_retrieval_config = embedding_config.get("retrieval_config")
+        if isinstance(nested_retrieval_config, dict) and nested_retrieval_config.get("selected_channels") is not None:
+            return list(nested_retrieval_config["selected_channels"])
+    return None
 
 
 def build_context_batch(
@@ -265,7 +383,7 @@ def resolve_conditioning_embeddings(
     args: argparse.Namespace,
     batch: dict[str, object],
     device: torch.device,
-    embedding_bank: TensorBank,
+    conditioning_bank: TensorBank,
     embedding_model,
     embedding_config: dict | None,
     model_type: str | None,
@@ -280,7 +398,7 @@ def resolve_conditioning_embeddings(
     eeg = batch["eeg"].to(device)
 
     if args.embedding_source == "ground_truth":
-        target = embedding_bank.align(query_ids, device=device).float()
+        target = conditioning_bank.align(query_ids, device=device).float()
         context = [{"conditioning_source": "ground_truth", "conditioning_image_id": image_id} for image_id in query_ids]
         return target, context
 
@@ -312,7 +430,7 @@ def resolve_conditioning_embeddings(
             topk=1,
         )
         conditioning_image_ids = [row[0] for row in top1_ids]
-        embeddings = embedding_bank.align(conditioning_image_ids, device=device).float()
+        embeddings = conditioning_bank.align(conditioning_image_ids, device=device).float()
         context = [
             {
                 "conditioning_source": "retrieval_top1",
@@ -338,7 +456,7 @@ def resolve_conditioning_embeddings(
             context_batch = build_context_batch(
                 base_outputs.retrieval_embedding,
                 retrieval_bank=retrieval_bank,
-                embedding_bank=embedding_bank,
+                embedding_bank=conditioning_bank,
                 device=device,
                 topk=effective_topk,
                 text_bank=text_bank if use_text_context else None,
@@ -377,6 +495,34 @@ def resolve_conditioning_embeddings(
     return predicted, context
 
 
+def adapt_conditioning_embeddings(
+    conditioning_embeddings: torch.Tensor,
+    conditioning_context: list[dict[str, object]],
+    *,
+    generation_bank: TensorBank,
+    conditioning_adapter,
+) -> tuple[torch.Tensor, list[dict[str, object]]]:
+    source_dim = int(conditioning_embeddings.shape[1])
+    target_dim = int(generation_bank.values.shape[1])
+    if source_dim == target_dim and conditioning_adapter is None:
+        return conditioning_embeddings, conditioning_context
+    if conditioning_adapter is None:
+        raise ValueError(
+            f"Conditioning embedding dim {source_dim} does not match generation bank dim {target_dim}. "
+            "Pass --conditioning-adapter."
+        )
+    with torch.no_grad():
+        adapted = conditioning_adapter(conditioning_embeddings).float()
+    updated_context = []
+    for item in conditioning_context:
+        new_item = dict(item)
+        new_item["conditioning_adapter_applied"] = True
+        new_item["conditioning_source_dim"] = source_dim
+        new_item["conditioning_target_dim"] = target_dim
+        updated_context.append(new_item)
+    return adapted, updated_context
+
+
 def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
@@ -388,15 +534,25 @@ def main() -> None:
     embedding_model = None
     embedding_config = None
     checkpoint_model_type = None
+    conditioning_adapter = None
     if args.reconstruction_checkpoint is not None:
         embedding_model, embedding_config, checkpoint_model_type = load_embedding_model(args.reconstruction_checkpoint, device)
+    if args.conditioning_adapter is not None:
+        conditioning_adapter, _ = load_conditioning_adapter(args.conditioning_adapter, device)
 
     if args.embedding_source == "predicted" and embedding_model is None:
         raise ValueError("--reconstruction-checkpoint is required when --embedding-source=predicted.")
 
-    embedding_bank_path = resolve_embedding_bank_path(args, embedding_config, args.reconstruction_checkpoint)
-    embedding_bank = TensorBank.load(embedding_bank_path)
-    generation_config = resolve_generation_config(args, embedding_config, embedding_bank_path)
+    generation_bank_path = resolve_embedding_bank_path(args, embedding_config, args.reconstruction_checkpoint)
+    conditioning_bank_path = resolve_conditioning_bank_path(
+        args,
+        embedding_config,
+        args.reconstruction_checkpoint,
+        generation_bank_path=generation_bank_path,
+    )
+    generation_bank = TensorBank.load(generation_bank_path)
+    conditioning_bank = TensorBank.load(conditioning_bank_path)
+    generation_config = resolve_generation_config(args, embedding_config, generation_bank_path)
 
     effective_model_type = args.model_type or checkpoint_model_type or (embedding_config.get("model_type") if embedding_config else "regression")
     base_paths = [PROJECT_ROOT]
@@ -456,6 +612,12 @@ def main() -> None:
             has_perceptual=perceptual_bank is not None,
         )
 
+    selected_channels = resolve_selected_channels(
+        args,
+        embedding_config=embedding_config,
+        retrieval_config=retrieval_config,
+    )
+
     prior_pipe = load_kandinsky_prior_pipeline(
         model_name=str(generation_config["prior_model"]),
         device=device,
@@ -475,7 +637,7 @@ def main() -> None:
         )
 
     negative_image_embed = negative_image_embed_from_bank(
-        embedding_bank,
+        generation_bank,
         batch_size=1,
         device=device,
         dtype=next(decoder_pipe.unet.parameters()).dtype,
@@ -487,6 +649,7 @@ def main() -> None:
         split=args.split,
         avg_trials=True,
         image_ids=selected_image_ids,
+        selected_channels=selected_channels,
     )
     loader = make_dataloader(
         EEGImageDataset(records),
@@ -512,7 +675,7 @@ def main() -> None:
             args=args,
             batch=batch,
             device=device,
-            embedding_bank=embedding_bank,
+            conditioning_bank=conditioning_bank,
             embedding_model=embedding_model,
             embedding_config=embedding_config,
             model_type=effective_model_type,
@@ -522,6 +685,12 @@ def main() -> None:
             semantic_bank=semantic_bank,
             perceptual_bank=perceptual_bank,
             alpha=alpha,
+        )
+        conditioning_embeddings, conditioning_context = adapt_conditioning_embeddings(
+            conditioning_embeddings,
+            conditioning_context,
+            generation_bank=generation_bank,
+            conditioning_adapter=conditioning_adapter,
         )
         generation = generate_best_images(
             predicted_embeddings=conditioning_embeddings,
@@ -536,6 +705,10 @@ def main() -> None:
             init_images=init_images,
             img2img_strength=args.img2img_strength,
             candidate_seed_offset=args.candidate_seed_offset,
+            selection_mode=args.candidate_selection_mode,
+            candidate_lowlevel_weight=args.candidate_lowlevel_weight,
+            candidate_lowlevel_metric=args.candidate_lowlevel_metric,
+            candidate_score_normalization=args.candidate_score_normalization,
         )
         selected_images = generation["selected_images"]
         saved_paths = save_image_batch(selected_images, list(batch["image_id"]), output_images_dir)
@@ -546,24 +719,33 @@ def main() -> None:
             all_real_images.extend(list(real_images))
 
         candidate_scores = generation["candidate_scores"].tolist()
+        candidate_semantic_scores = generation["candidate_semantic_scores"].tolist()
+        raw_candidate_lowlevel_scores = generation["candidate_lowlevel_scores"]
+        candidate_lowlevel_scores = (
+            None if raw_candidate_lowlevel_scores is None else raw_candidate_lowlevel_scores.tolist()
+        )
         selected_indices = generation["selected_candidate_indices"].tolist()
         selected_scores = generation["selected_scores"].tolist()
         candidate_seeds = generation["candidate_seeds"]
         selected_seeds = generation["selected_candidate_seeds"]
 
-        for query_id, output_path, selected_index, selected_seed, selected_score, scores, context in zip(
+        for row_index, (query_id, output_path, selected_index, selected_seed, selected_score, scores, semantic_scores, context) in enumerate(zip(
             batch["image_id"],
             saved_paths,
             selected_indices,
             selected_seeds,
             selected_scores,
             candidate_scores,
+            candidate_semantic_scores,
             conditioning_context,
             strict=True,
-        ):
+        )):
             init_image_path = None
             if init_paths is not None:
                 init_image_path = str((args.init_image_dir / f"{query_id}.png").resolve())
+            lowlevel_scores = None
+            if candidate_lowlevel_scores is not None:
+                lowlevel_scores = candidate_lowlevel_scores[row_index]
             item = {
                 "query_image_id": query_id,
                 "output_path": output_path,
@@ -575,12 +757,19 @@ def main() -> None:
                 "img2img_strength": float(args.img2img_strength) if args.init_image_dir is not None else None,
                 "candidate_seed_offset": int(args.candidate_seed_offset),
                 "generation_mode": generation["generation_mode"],
-                "selection_mode": "max_cosine_to_conditioning_embedding",
+                "selection_mode": generation["selection_mode"],
+                "candidate_lowlevel_weight": float(args.candidate_lowlevel_weight),
+                "candidate_lowlevel_metric": args.candidate_lowlevel_metric,
+                "candidate_score_normalization": args.candidate_score_normalization,
                 "candidate_seeds": candidate_seeds,
                 "selected_candidate_index": int(selected_index),
                 "selected_candidate_seed": int(selected_seed),
-                "selected_cosine": float(selected_score),
+                "selected_score": float(selected_score),
                 "candidate_scores": [float(score) for score in scores],
+                "candidate_semantic_scores": [float(score) for score in semantic_scores],
+                "candidate_lowlevel_scores": None
+                if lowlevel_scores is None
+                else [float(score) for score in lowlevel_scores],
             }
             item.update(context)
             metadata.append(item)
@@ -591,11 +780,14 @@ def main() -> None:
             "split_file": None if args.split_file is None else str(args.split_file.resolve()),
             "image_id_source": args.image_id_source,
             "embedding_source": args.embedding_source,
-            "embedding_bank": str(embedding_bank_path),
+            "selected_channels": selected_channels,
+            "conditioning_bank": str(conditioning_bank_path),
+            "generation_bank": str(generation_bank_path),
             "retrieval_bank": None if retrieval_bank is None else retrieval_bank.bank_type,
             "text_bank": None if text_bank is None else text_bank.bank_type,
             "mode": "embedding_decoder",
             "model_type": effective_model_type,
+            "conditioning_adapter": None if args.conditioning_adapter is None else str(args.conditioning_adapter.resolve()),
             "decoder_model": str(generation_config["decoder_model"]),
             "prior_model": str(generation_config["prior_model"]),
             "num_candidates": float(generation_config["num_candidates"]),
@@ -607,6 +799,10 @@ def main() -> None:
             "init_image_dir": None if args.init_image_dir is None else str(args.init_image_dir.resolve()),
             "img2img_strength": float(args.img2img_strength) if args.init_image_dir is not None else None,
             "candidate_seed_offset": int(args.candidate_seed_offset),
+            "candidate_selection_mode": args.candidate_selection_mode,
+            "candidate_lowlevel_weight": float(args.candidate_lowlevel_weight),
+            "candidate_lowlevel_metric": args.candidate_lowlevel_metric,
+            "candidate_score_normalization": args.candidate_score_normalization,
             "reconstruction_checkpoint": None
             if args.reconstruction_checkpoint is None
             else str(args.reconstruction_checkpoint.resolve()),
@@ -627,6 +823,7 @@ def main() -> None:
         metrics["num_candidates"] = float(generation_config["num_candidates"])
         metrics["decoder_steps"] = float(generation_config["decoder_steps"])
         metrics["decoder_guidance_scale"] = float(generation_config["decoder_guidance_scale"])
+        metrics["candidate_lowlevel_weight"] = float(args.candidate_lowlevel_weight)
         save_json(metrics, args.output_dir / "reconstruction_metrics.json")
         print(metrics)
     else:

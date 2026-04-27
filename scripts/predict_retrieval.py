@@ -9,7 +9,13 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from project1_eeg.data import EEGImageDataset, load_eeg_records, load_split_image_ids
+from project1_eeg.data import (
+    DEFAULT_CHANNEL_SUBSET_FILE,
+    EEGImageDataset,
+    load_eeg_records,
+    load_split_image_ids,
+    resolve_channel_subset,
+)
 from project1_eeg.evaluation import compute_retrieval_metrics, rank_candidate_ids
 from project1_eeg.image_banks import TensorBank, default_bank_path
 from project1_eeg.retrieval import build_retrieval_model_from_config
@@ -55,22 +61,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=["train", "test"], default="test")
     parser.add_argument("--split-file", type=Path, default=None)
     parser.add_argument("--image-id-source", choices=["all", "train_ids", "val_ids"], default="all")
+    parser.add_argument(
+        "--candidate-source",
+        choices=["auto", "bank"],
+        default="auto",
+        help="Use query ids as train candidates by default; use bank to rank against the full embedding bank.",
+    )
     parser.add_argument("--selected-channels", nargs="+", default=None)
     parser.add_argument("--channel-preset", choices=sorted(CHANNEL_PRESETS.keys()), default=None)
+    parser.add_argument("--channel-subset-name", type=str, default=None)
+    parser.add_argument("--channel-subset-file", type=Path, default=DEFAULT_CHANNEL_SUBSET_FILE)
+    parser.add_argument("--tta-trial-views", type=int, default=1)
+    parser.add_argument("--tta-trial-k", type=int, default=None)
+    parser.add_argument("--tta-trial-k-min", type=int, default=8)
+    parser.add_argument("--tta-trial-k-max", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
-def resolve_selected_channels(args: argparse.Namespace, config: dict) -> list[str] | None:
-    if args.selected_channels and args.channel_preset:
-        raise ValueError("--selected-channels and --channel-preset cannot both be set.")
+def resolve_selected_channels(args: argparse.Namespace, config: dict) -> tuple[str | None, Path, list[str] | None]:
+    explicit_sources = sum(
+        bool(value)
+        for value in (args.selected_channels, args.channel_preset, args.channel_subset_name)
+    )
+    if explicit_sources > 1:
+        raise ValueError("--selected-channels, --channel-preset, and --channel-subset-name are mutually exclusive.")
     if args.selected_channels:
-        return [str(channel) for channel in args.selected_channels]
+        return None, args.channel_subset_file, [str(channel) for channel in args.selected_channels]
     if args.channel_preset:
-        return list(CHANNEL_PRESETS[args.channel_preset])
+        return None, args.channel_subset_file, list(CHANNEL_PRESETS[args.channel_preset])
+    subset_name = args.channel_subset_name or config.get("channel_subset_name")
+    subset_file = args.channel_subset_file
+    config_subset_file = config.get("channel_subset_file")
+    if config_subset_file and args.channel_subset_file == DEFAULT_CHANNEL_SUBSET_FILE:
+        subset_file = Path(config_subset_file)
+    if subset_name:
+        return subset_name, subset_file, resolve_channel_subset(subset_name, subset_file=subset_file)
     configured = config.get("selected_channels")
     if configured is None:
-        return None
-    return [str(channel) for channel in configured]
+        return None, subset_file, None
+    return subset_name, subset_file, [str(channel) for channel in configured]
 
 
 def resolve_bank(path: Path | None, fallback: str | None, *, name: str) -> TensorBank | None:
@@ -107,6 +137,21 @@ def resolve_alpha(args: argparse.Namespace, payload: dict, has_semantic: bool, h
     return 0.5
 
 
+def average_component_logits(
+    accumulated: dict[str, torch.Tensor],
+    current: dict[str, torch.Tensor],
+    *,
+    weight: float,
+) -> dict[str, torch.Tensor]:
+    for name, logits in current.items():
+        value = logits.float() * weight
+        if name in accumulated:
+            accumulated[name] = accumulated[name] + value
+        else:
+            accumulated[name] = value
+    return accumulated
+
+
 def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
@@ -128,22 +173,22 @@ def main() -> None:
     if semantic_bank is None and perceptual_bank is None:
         raise ValueError("At least one of --semantic-bank or --perceptual-bank must resolve to a bank.")
 
-    selected_channels = resolve_selected_channels(args, config)
+    channel_subset_name, channel_subset_file, selected_channels = resolve_selected_channels(args, config)
     selected_image_ids = load_split_image_ids(args.split_file, image_id_source=args.image_id_source)
+    use_trial_tta = args.tta_trial_views > 1 or args.tta_trial_k is not None
+    if args.tta_trial_views < 1:
+        raise ValueError("--tta-trial-views must be >= 1.")
+    if args.tta_trial_k is not None and args.tta_trial_k < 1:
+        raise ValueError("--tta-trial-k must be >= 1.")
+
     records = load_eeg_records(
         data_dir=args.data_dir,
         split=args.split,
-        avg_trials=True,
+        avg_trials=not use_trial_tta,
+        preserve_trials=use_trial_tta,
         selected_channels=selected_channels,
         image_ids=selected_image_ids,
     )
-    loader = make_dataloader(
-        EEGImageDataset(records),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
-    outputs, query_image_ids, _ = compute_retrieval_outputs(model, loader, device)
 
     alpha = resolve_alpha(
         args,
@@ -151,21 +196,73 @@ def main() -> None:
         has_semantic=semantic_bank is not None,
         has_perceptual=perceptual_bank is not None,
     )
-    candidate_image_ids = query_image_ids if args.split == "train" else None
-    logits, resolved_candidate_ids, component_logits = compute_retrieval_logits(
-        model,
-        outputs,
-        semantic_bank=semantic_bank,
-        perceptual_bank=perceptual_bank,
-        candidate_image_ids=candidate_image_ids,
-        alpha=alpha,
-    )
+    logits_accum: torch.Tensor | None = None
+    component_logits_accum: dict[str, torch.Tensor] = {}
+    query_image_ids: list[str] | None = None
+    resolved_candidate_ids: list[str] | None = None
+    view_weight = 1.0 / float(args.tta_trial_views)
+
+    for view_idx in range(args.tta_trial_views):
+        if use_trial_tta:
+            torch.manual_seed(int(args.seed) + view_idx)
+        trial_k_min = args.tta_trial_k if args.tta_trial_k is not None else args.tta_trial_k_min
+        trial_k_max = args.tta_trial_k if args.tta_trial_k is not None else args.tta_trial_k_max
+        loader = make_dataloader(
+            EEGImageDataset(
+                records,
+                trial_sampling="random_avg" if use_trial_tta else "none",
+                trial_k_min=trial_k_min,
+                trial_k_max=trial_k_max,
+            ),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+        outputs, view_query_image_ids, _ = compute_retrieval_outputs(model, loader, device)
+        if query_image_ids is None:
+            query_image_ids = view_query_image_ids
+        elif query_image_ids != view_query_image_ids:
+            raise ValueError("Query image ordering changed across trial-TTA views.")
+        view_candidate_image_ids = query_image_ids if args.split == "train" and args.candidate_source == "auto" else None
+        view_logits, view_candidate_ids, view_component_logits = compute_retrieval_logits(
+            model,
+            outputs,
+            semantic_bank=semantic_bank,
+            perceptual_bank=perceptual_bank,
+            candidate_image_ids=view_candidate_image_ids,
+            alpha=alpha,
+        )
+        if resolved_candidate_ids is None:
+            resolved_candidate_ids = view_candidate_ids
+        elif resolved_candidate_ids != view_candidate_ids:
+            raise ValueError("Candidate image ordering changed across trial-TTA views.")
+        weighted_logits = view_logits.float() * view_weight
+        logits_accum = weighted_logits if logits_accum is None else logits_accum + weighted_logits
+        component_logits_accum = average_component_logits(
+            component_logits_accum,
+            view_component_logits,
+            weight=view_weight,
+        )
+
+    assert query_image_ids is not None
+    assert resolved_candidate_ids is not None
+    assert logits_accum is not None
+    logits = logits_accum
+    component_logits = component_logits_accum
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "split": args.split,
             "image_id_source": args.image_id_source,
+            "candidate_source": args.candidate_source,
+            "channel_subset_name": channel_subset_name,
+            "channel_subset_file": str(channel_subset_file),
+            "selected_channels": selected_channels,
+            "tta_trial_views": int(args.tta_trial_views),
+            "tta_trial_k": args.tta_trial_k,
+            "tta_trial_k_min": int(args.tta_trial_k_min),
+            "tta_trial_k_max": int(args.tta_trial_k_max),
             "ordered_query_image_ids": query_image_ids,
             "candidate_image_ids": resolved_candidate_ids,
             "alpha": alpha,
@@ -188,6 +285,14 @@ def main() -> None:
         {
             "split": args.split,
             "image_id_source": args.image_id_source,
+            "candidate_source": args.candidate_source,
+            "channel_subset_name": channel_subset_name,
+            "channel_subset_file": str(channel_subset_file),
+            "selected_channels": selected_channels,
+            "tta_trial_views": int(args.tta_trial_views),
+            "tta_trial_k": args.tta_trial_k,
+            "tta_trial_k_min": int(args.tta_trial_k_min),
+            "tta_trial_k_max": int(args.tta_trial_k_max),
             "alpha": alpha,
             "predictions": ranking_payload,
         },
@@ -201,6 +306,9 @@ def main() -> None:
             candidate_image_ids=resolved_candidate_ids,
         )
         metrics["alpha"] = float(alpha)
+        metrics["channel_subset_name"] = channel_subset_name
+        metrics["tta_trial_views"] = int(args.tta_trial_views)
+        metrics["tta_trial_k"] = args.tta_trial_k
         save_json(metrics, args.output_dir / "retrieval_metrics.json")
         print(metrics)
     else:

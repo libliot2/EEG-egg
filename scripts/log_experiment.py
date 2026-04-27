@@ -149,6 +149,12 @@ def generate_attempt_id(area: str, timestamp: datetime) -> str:
 
 def infer_metric_scope(output_dir: Path | None, metrics: dict[str, Any] | None) -> str:
     if metrics:
+        if metrics.get("split") == "test":
+            return "test"
+        if metrics.get("split") == "train":
+            if output_dir is not None and "val" in str(output_dir).lower():
+                return "val"
+            return "unknown"
         if "top1_acc" in metrics or "eval_clip" in metrics:
             if output_dir is not None and "smoke" in str(output_dir).lower():
                 return "smoke"
@@ -585,6 +591,17 @@ def find_attempt_context(entries: list[dict[str, Any]], attempt_id: str) -> dict
     return matches[0]
 
 
+def find_attempt_context_by_output_dir(entries: list[dict[str, Any]], output_dir: Path | None) -> dict[str, Any] | None:
+    if output_dir is None:
+        return None
+
+    resolved = str(output_dir.resolve())
+    matches = [entry for entry in entries if entry.get("output_dir") == resolved]
+    if not matches:
+        return None
+    return matches[0]
+
+
 def build_entry(args: argparse.Namespace, existing_context: dict[str, Any] | None) -> dict[str, Any]:
     timestamp = parse_timestamp(args.timestamp)
     attempt_id = args.attempt_id or generate_attempt_id(args.area, timestamp)
@@ -636,6 +653,8 @@ def main() -> None:
     log_text = args.log_path.read_text(encoding="utf-8")
     existing_entries = parse_meta_entries(log_text)
     existing_context = find_attempt_context(existing_entries, args.attempt_id) if args.attempt_id else None
+    if existing_context is None and args.output_dir is not None:
+        existing_context = find_attempt_context_by_output_dir(existing_entries, args.output_dir)
 
     entry = build_entry(args, existing_context)
     rendered = render_entry(entry)

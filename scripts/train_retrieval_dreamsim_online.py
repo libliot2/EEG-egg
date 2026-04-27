@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-dim", type=int, default=768)
     parser.add_argument("--channel-dropout", type=float, default=0.1)
     parser.add_argument("--time-mask-ratio", type=float, default=0.1)
-    parser.add_argument("--encoder-type", choices=["atm_small", "atm_base", "atm_large", "atm_spatial", "atm_multiscale", "eeg_conformer"], default="atm_large")
+    parser.add_argument("--encoder-type", choices=["atm_small", "atm_base", "atm_large", "atm_spatial", "atm_multiscale", "eeg_conformer", "atm_region_expert", "atm_posterior_expert"], default="atm_large")
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)

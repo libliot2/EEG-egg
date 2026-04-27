@@ -8,6 +8,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+ALL_63_CHANNELS: tuple[str, ...] = (
+    "Fp1", "Fp2", "AF7", "AF3", "AFz", "AF4", "AF8", "F7", "F5", "F3", "F1", "F2", "F4", "F6", "F8",
+    "FT9", "FT7", "FC5", "FC3", "FC1", "FCz", "FC2", "FC4", "FC6", "FT8", "FT10",
+    "T7", "C5", "C3", "C1", "Cz", "C2", "C4", "C6", "T8",
+    "TP9", "TP7", "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6", "TP8", "TP10",
+    "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8", "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2",
+)
+POSTERIOR_CP_28_CHANNELS: tuple[str, ...] = (
+    "TP9", "TP7", "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6", "TP8", "TP10",
+    "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8", "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2",
+)
+VISUAL17_CHANNELS: tuple[str, ...] = (
+    "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8", "PO7", "PO3", "POz", "PO4", "PO8", "O1", "Oz", "O2",
+)
+CENTROPARIETAL_11_CHANNELS: tuple[str, ...] = (
+    "TP9", "TP7", "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6", "TP8", "TP10",
+)
+
+
 class EEGPerturbation(nn.Module):
     def __init__(self, in_channels: int) -> None:
         super().__init__()
@@ -16,6 +35,21 @@ class EEGPerturbation(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * self.weight + self.bias
+
+
+class ChannelGate(nn.Module):
+    def __init__(self, in_channels: int) -> None:
+        super().__init__()
+        self.logits = nn.Parameter(torch.zeros(1, in_channels, 1))
+
+    def gates(self) -> torch.Tensor:
+        return 2.0 * torch.sigmoid(self.logits)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gates()
+
+    def regularization(self) -> torch.Tensor:
+        return self.gates().mean()
 
 
 class TargetFeatureAdapter(nn.Module):
@@ -554,6 +588,182 @@ class EEGConformerEncoder(nn.Module):
         return self.projection(torch.cat([cls_repr, patch_pooled], dim=-1))
 
 
+class ATMRegionExpertEncoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_channels: int = 63,
+        hidden_dim: int = 256,
+        embedding_dim: int = 768,
+        channel_dropout: float = 0.1,
+        time_mask_ratio: float = 0.1,
+        transformer_layers: int = 2,
+        transformer_heads: int = 8,
+        dropout: float = 0.1,
+        use_eeg_perturbation: bool = False,
+    ) -> None:
+        super().__init__()
+        if in_channels != len(ALL_63_CHANNELS):
+            raise ValueError(
+                "ATMRegionExpertEncoder expects all 63 EEG channels in canonical THINGS-EEG order."
+            )
+        channel_to_index = {name: idx for idx, name in enumerate(ALL_63_CHANNELS)}
+        posterior_indices = [channel_to_index[name] for name in POSTERIOR_CP_28_CHANNELS]
+        visual_indices = [channel_to_index[name] for name in VISUAL17_CHANNELS]
+        self.register_buffer("posterior_indices", torch.tensor(posterior_indices, dtype=torch.long), persistent=False)
+        self.register_buffer("visual_indices", torch.tensor(visual_indices, dtype=torch.long), persistent=False)
+        local_hidden_dim = max(hidden_dim // 2, 128)
+        local_heads = max(2, min(transformer_heads, 4))
+
+        self.global_branch = ATMLargeEncoder(
+            in_channels=in_channels,
+            hidden_dim=hidden_dim,
+            embedding_dim=embedding_dim,
+            channel_dropout=channel_dropout,
+            time_mask_ratio=time_mask_ratio,
+            transformer_layers=transformer_layers,
+            transformer_heads=transformer_heads,
+            dropout=dropout,
+            use_eeg_perturbation=use_eeg_perturbation,
+        )
+        self.posterior_branch = ATMBaseEncoder(
+            in_channels=len(posterior_indices),
+            hidden_dim=local_hidden_dim,
+            embedding_dim=embedding_dim,
+            channel_dropout=channel_dropout,
+            time_mask_ratio=time_mask_ratio,
+            transformer_layers=transformer_layers,
+            transformer_heads=local_heads,
+            dropout=dropout,
+            use_eeg_perturbation=False,
+        )
+        self.visual_branch = ATMBaseEncoder(
+            in_channels=len(visual_indices),
+            hidden_dim=local_hidden_dim,
+            embedding_dim=embedding_dim,
+            channel_dropout=channel_dropout,
+            time_mask_ratio=time_mask_ratio,
+            transformer_layers=transformer_layers,
+            transformer_heads=local_heads,
+            dropout=dropout,
+            use_eeg_perturbation=False,
+        )
+        self.branch_gate = nn.Sequential(
+            nn.LayerNorm(embedding_dim * 3),
+            nn.Linear(embedding_dim * 3, embedding_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(embedding_dim, 3),
+        )
+        self.projection = nn.Sequential(
+            nn.LayerNorm(embedding_dim * 4),
+            nn.Linear(embedding_dim * 4, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim * 4, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        global_features = self.global_branch(x)
+        posterior_features = self.posterior_branch(x.index_select(1, self.posterior_indices))
+        visual_features = self.visual_branch(x.index_select(1, self.visual_indices))
+        stacked = torch.stack([global_features, posterior_features, visual_features], dim=1)
+        gate_logits = self.branch_gate(
+            torch.cat([global_features, posterior_features, visual_features], dim=-1)
+        )
+        gate_weights = torch.softmax(gate_logits, dim=-1).unsqueeze(-1)
+        fused = torch.sum(stacked * gate_weights, dim=1)
+        return self.projection(torch.cat([fused, global_features, posterior_features, visual_features], dim=-1))
+
+
+class ATMPosteriorExpertEncoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_channels: int = 28,
+        hidden_dim: int = 256,
+        embedding_dim: int = 768,
+        channel_dropout: float = 0.1,
+        time_mask_ratio: float = 0.1,
+        transformer_layers: int = 2,
+        transformer_heads: int = 8,
+        dropout: float = 0.1,
+        use_eeg_perturbation: bool = False,
+    ) -> None:
+        super().__init__()
+        if in_channels != len(POSTERIOR_CP_28_CHANNELS):
+            raise ValueError(
+                "ATMPosteriorExpertEncoder expects the posterior_cp_28 channel subset in canonical order."
+            )
+        channel_to_index = {name: idx for idx, name in enumerate(POSTERIOR_CP_28_CHANNELS)}
+        visual_indices = [channel_to_index[name] for name in VISUAL17_CHANNELS]
+        cp_indices = [channel_to_index[name] for name in CENTROPARIETAL_11_CHANNELS]
+        self.register_buffer("visual_indices", torch.tensor(visual_indices, dtype=torch.long), persistent=False)
+        self.register_buffer("cp_indices", torch.tensor(cp_indices, dtype=torch.long), persistent=False)
+        local_hidden_dim = max(hidden_dim // 2, 128)
+        local_heads = max(2, min(transformer_heads, 4))
+
+        self.full_branch = ATMBaseEncoder(
+            in_channels=in_channels,
+            hidden_dim=hidden_dim,
+            embedding_dim=embedding_dim,
+            channel_dropout=channel_dropout,
+            time_mask_ratio=time_mask_ratio,
+            transformer_layers=transformer_layers,
+            transformer_heads=transformer_heads,
+            dropout=dropout,
+            use_eeg_perturbation=use_eeg_perturbation,
+        )
+        self.visual_branch = ATMBaseEncoder(
+            in_channels=len(visual_indices),
+            hidden_dim=local_hidden_dim,
+            embedding_dim=embedding_dim,
+            channel_dropout=channel_dropout,
+            time_mask_ratio=time_mask_ratio,
+            transformer_layers=transformer_layers,
+            transformer_heads=local_heads,
+            dropout=dropout,
+            use_eeg_perturbation=False,
+        )
+        self.cp_branch = ATMSmallEncoder(
+            in_channels=len(cp_indices),
+            hidden_dim=local_hidden_dim,
+            embedding_dim=embedding_dim,
+            channel_dropout=channel_dropout,
+            time_mask_ratio=time_mask_ratio,
+            transformer_layers=transformer_layers,
+            transformer_heads=local_heads,
+            dropout=dropout,
+            use_eeg_perturbation=False,
+        )
+        self.branch_gate = nn.Sequential(
+            nn.LayerNorm(embedding_dim * 3),
+            nn.Linear(embedding_dim * 3, embedding_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(embedding_dim, 3),
+        )
+        self.projection = nn.Sequential(
+            nn.LayerNorm(embedding_dim * 4),
+            nn.Linear(embedding_dim * 4, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim * 4, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        full_features = self.full_branch(x)
+        visual_features = self.visual_branch(x.index_select(1, self.visual_indices))
+        cp_features = self.cp_branch(x.index_select(1, self.cp_indices))
+        stacked = torch.stack([full_features, visual_features, cp_features], dim=1)
+        gate_logits = self.branch_gate(torch.cat([full_features, visual_features, cp_features], dim=-1))
+        gate_weights = torch.softmax(gate_logits, dim=-1).unsqueeze(-1)
+        fused = torch.sum(stacked * gate_weights, dim=1)
+        return self.projection(torch.cat([fused, full_features, visual_features, cp_features], dim=-1))
+
+
 class ProjectionHead(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1) -> None:
         super().__init__()
@@ -616,6 +826,7 @@ class RetrievalModel(nn.Module):
         target_adapter_hidden_dim: int = 1024,
         target_adapter_dropout: float = 0.1,
         target_adapter_beta: float = 0.1,
+        use_channel_gate: bool = False,
     ) -> None:
         super().__init__()
         self.encoder_type = encoder_type
@@ -623,6 +834,7 @@ class RetrievalModel(nn.Module):
         self.semantic_dim = semantic_dim
         self.perceptual_dim = perceptual_dim
         self.target_adapter_beta = float(target_adapter_beta)
+        self.channel_gate = ChannelGate(in_channels) if use_channel_gate else nn.Identity()
         self.legacy_mode = (
             encoder_type == "legacy_cnn"
             and perceptual_dim is None
@@ -653,6 +865,8 @@ class RetrievalModel(nn.Module):
             "atm_spatial": ATMSpatialEncoder,
             "atm_multiscale": ATMMultiScaleEncoder,
             "eeg_conformer": EEGConformerEncoder,
+            "atm_region_expert": ATMRegionExpertEncoder,
+            "atm_posterior_expert": ATMPosteriorExpertEncoder,
         }.get(encoder_type)
         if encoder_cls is None:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
@@ -711,6 +925,7 @@ class RetrievalModel(nn.Module):
         return int(dim)
 
     def encode_all(self, eeg: torch.Tensor) -> RetrievalOutputs:
+        eeg = self.channel_gate(eeg)
         if self.legacy_mode:
             return RetrievalOutputs(legacy=self.encoder(eeg))
 
@@ -776,6 +991,11 @@ class RetrievalModel(nn.Module):
         adapted = adapter(image_embeddings)
         baseline = F.normalize(image_embeddings, dim=-1)
         return F.mse_loss(adapted, baseline)
+
+    def channel_gate_regularization(self) -> torch.Tensor | None:
+        if isinstance(self.channel_gate, ChannelGate):
+            return self.channel_gate.regularization()
+        return None
 
 
 def retrieval_loss(
@@ -1167,4 +1387,5 @@ def build_retrieval_model_from_config(config: dict) -> RetrievalModel:
         target_adapter_hidden_dim=int(config.get("target_adapter_hidden_dim", 1024)),
         target_adapter_dropout=float(config.get("target_adapter_dropout", 0.1)),
         target_adapter_beta=float(config.get("target_adapter_beta", 0.1)),
+        use_channel_gate=bool(config.get("use_channel_gate", False)),
     )

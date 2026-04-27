@@ -267,9 +267,21 @@ def select_best_candidate_images(
     prior_pipe,
     predicted_embeddings: torch.Tensor,
     candidate_images: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    init_images: torch.Tensor | None = None,
+    selection_mode: str = "semantic",
+    lowlevel_weight: float = 0.0,
+    lowlevel_metric: str = "pixel_cosine",
+    score_normalization: str = "per_query_minmax",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     if candidate_images.ndim != 5:
         raise ValueError("candidate_images must have shape [num_candidates, batch, channels, height, width].")
+    if selection_mode not in {"semantic", "semantic_lowlevel"}:
+        raise ValueError(f"Unsupported selection_mode: {selection_mode}")
+    if lowlevel_metric not in {"pixel_cosine", "neg_mse"}:
+        raise ValueError(f"Unsupported lowlevel_metric: {lowlevel_metric}")
+    if score_normalization not in {"none", "per_query_minmax", "per_query_zscore"}:
+        raise ValueError(f"Unsupported score_normalization: {score_normalization}")
 
     num_candidates, batch_size = candidate_images.shape[:2]
     flattened = candidate_images.reshape(num_candidates * batch_size, *candidate_images.shape[2:])
@@ -279,7 +291,24 @@ def select_best_candidate_images(
 
     pred_norm = F.normalize(predicted_embeddings.to(candidate_embeds.device).float(), dim=-1)
     cand_norm = F.normalize(candidate_embeds.float(), dim=-1)
-    candidate_scores = (cand_norm * pred_norm.unsqueeze(1)).sum(dim=-1)
+    semantic_scores = (cand_norm * pred_norm.unsqueeze(1)).sum(dim=-1)
+    candidate_scores = semantic_scores
+    lowlevel_scores = None
+
+    if selection_mode == "semantic_lowlevel":
+        if init_images is None:
+            raise ValueError("selection_mode='semantic_lowlevel' requires init_images.")
+        lowlevel_scores = compute_lowlevel_candidate_scores(
+            candidate_images,
+            init_images,
+            metric=lowlevel_metric,
+        ).to(semantic_scores.device)
+        candidate_scores = combine_candidate_scores(
+            semantic_scores,
+            lowlevel_scores,
+            lowlevel_weight=lowlevel_weight,
+            normalization=score_normalization,
+        )
     selected_indices = candidate_scores.argmax(dim=1)
 
     selected_images = torch.stack(
@@ -287,7 +316,75 @@ def select_best_candidate_images(
         dim=0,
     )
     selected_scores = candidate_scores[torch.arange(batch_size, device=candidate_scores.device), selected_indices].cpu()
-    return selected_images, selected_indices.cpu(), selected_scores, candidate_scores.cpu()
+    return selected_images, selected_indices.cpu(), selected_scores, candidate_scores.cpu(), semantic_scores.cpu(), (
+        None if lowlevel_scores is None else lowlevel_scores.cpu()
+    )
+
+
+def normalize_candidate_scores(scores: torch.Tensor, *, mode: str) -> torch.Tensor:
+    if mode == "none":
+        return scores
+    if mode == "per_query_minmax":
+        min_values = scores.min(dim=1, keepdim=True).values
+        max_values = scores.max(dim=1, keepdim=True).values
+        return (scores - min_values) / (max_values - min_values).clamp_min(1e-6)
+    if mode == "per_query_zscore":
+        mean = scores.mean(dim=1, keepdim=True)
+        std = scores.std(dim=1, keepdim=True, unbiased=False)
+        return (scores - mean) / std.clamp_min(1e-6)
+    raise ValueError(f"Unsupported score normalization mode: {mode}")
+
+
+def combine_candidate_scores(
+    semantic_scores: torch.Tensor,
+    lowlevel_scores: torch.Tensor,
+    *,
+    lowlevel_weight: float,
+    normalization: str,
+) -> torch.Tensor:
+    semantic = normalize_candidate_scores(semantic_scores.float(), mode=normalization)
+    lowlevel = normalize_candidate_scores(lowlevel_scores.float(), mode=normalization)
+    return semantic + float(lowlevel_weight) * lowlevel
+
+
+def compute_lowlevel_candidate_scores(
+    candidate_images: torch.Tensor,
+    init_images: torch.Tensor,
+    *,
+    metric: str,
+) -> torch.Tensor:
+    if init_images.ndim != 4:
+        raise ValueError("init_images must have shape [batch, channels, height, width].")
+    num_candidates, batch_size = candidate_images.shape[:2]
+    if init_images.shape[0] != batch_size:
+        raise ValueError(
+            f"init_images batch size {init_images.shape[0]} does not match candidate batch size {batch_size}."
+        )
+
+    candidates = candidate_images.float()
+    init = init_images.float().cpu()
+    if candidates.shape[-2:] != init.shape[-2:]:
+        init = F.interpolate(init, size=candidates.shape[-2:], mode="bilinear", align_corners=False)
+    if candidates.shape[-1] > 128 or candidates.shape[-2] > 128:
+        target_size = (128, 128)
+        channels = candidates.shape[2]
+        candidates = F.interpolate(
+            candidates.reshape(num_candidates * batch_size, *candidates.shape[2:]),
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        ).reshape(num_candidates, batch_size, channels, *target_size)
+        init = F.interpolate(init, size=target_size, mode="bilinear", align_corners=False)
+
+    if metric == "pixel_cosine":
+        flat_candidates = candidates.flatten(start_dim=2)
+        flat_init = init.flatten(start_dim=1)
+        flat_candidates = F.normalize(flat_candidates, dim=-1)
+        flat_init = F.normalize(flat_init, dim=-1)
+        return (flat_candidates * flat_init.unsqueeze(0)).sum(dim=-1).transpose(0, 1)
+    if metric == "neg_mse":
+        return -((candidates - init.unsqueeze(0)) ** 2).mean(dim=(2, 3, 4)).transpose(0, 1)
+    raise ValueError(f"Unsupported lowlevel metric: {metric}")
 
 
 @torch.no_grad()
@@ -305,6 +402,10 @@ def generate_best_images(
     init_images: torch.Tensor | None = None,
     img2img_strength: float = 0.3,
     candidate_seed_offset: int = 0,
+    selection_mode: str = "semantic",
+    candidate_lowlevel_weight: float = 0.0,
+    candidate_lowlevel_metric: str = "pixel_cosine",
+    candidate_score_normalization: str = "per_query_minmax",
 ) -> dict[str, torch.Tensor | list[int]]:
     candidate_seeds = list(range(candidate_seed_offset, candidate_seed_offset + num_candidates))
     negatives = negative_image_embeds
@@ -323,10 +424,22 @@ def generate_best_images(
         init_images=init_images,
         strength=img2img_strength,
     )
-    selected_images, selected_indices, selected_scores, candidate_scores = select_best_candidate_images(
+    (
+        selected_images,
+        selected_indices,
+        selected_scores,
+        candidate_scores,
+        candidate_semantic_scores,
+        candidate_lowlevel_scores,
+    ) = select_best_candidate_images(
         prior_pipe,
         predicted_embeddings,
         candidate_images,
+        init_images=init_images,
+        selection_mode=selection_mode,
+        lowlevel_weight=candidate_lowlevel_weight,
+        lowlevel_metric=candidate_lowlevel_metric,
+        score_normalization=candidate_score_normalization,
     )
     selected_seeds = [candidate_seeds[index] for index in selected_indices.tolist()]
     return {
@@ -336,6 +449,9 @@ def generate_best_images(
         "selected_candidate_seeds": selected_seeds,
         "selected_scores": selected_scores,
         "candidate_scores": candidate_scores,
+        "candidate_semantic_scores": candidate_semantic_scores,
+        "candidate_lowlevel_scores": candidate_lowlevel_scores,
         "candidate_seeds": candidate_seeds,
         "generation_mode": "img2img" if init_images is not None else "text2img",
+        "selection_mode": selection_mode,
     }
